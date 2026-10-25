@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+# release zips and test output, rebuilt by tools/build_release.py and tests/
+dist/
