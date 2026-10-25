@@ -232,6 +232,80 @@ bpy.ops.skin_jiggle.remove_bone_jiggle(bone_name="Breast")
 check("removing the last jiggle bone clears the rig flag",
       "sj_jiggle_bones" not in arm and sjp._is_collider(body))
 
+# 9 squash & stretch: amount scales the stretch, Volume sets the thickness
+stretch_scene = bpy.data.scenes.new("Stretch test")
+stretch_scene.render.fps = 24
+stretch_scene.frame_start, stretch_scene.frame_end = 1, 40
+bpy.context.window.scene = stretch_scene
+cases = [(0.0, 1.0), (1.0, 1.0), (2.0, 1.0), (1.0, 0.0), (1.0, 2.0)]
+rigs = []
+for i, (amount, volume) in enumerate(cases):
+    rig = bpy.data.objects.new(f"StretchRig{i}", bpy.data.armatures.new(f"StretchRig{i}"))
+    stretch_scene.collection.objects.link(rig)
+    bpy.context.view_layer.objects.active = rig
+    rig.select_set(True)
+    bpy.ops.object.mode_set(mode='EDIT')
+    base = rig.data.edit_bones.new("Base"); base.head, base.tail = (0, 0, 1.0), (0, 0, 1.2)
+    tipb = rig.data.edit_bones.new("Tip"); tipb.head, tipb.tail = (0, 0, 1.2), (0, 0.2, 1.2)
+    tipb.parent = base
+    bpy.ops.object.mode_set(mode='OBJECT')
+    rig.location.x = i * 1.0
+    # jerk 3 cm along the Tip bone's axis over 3 frames, then stop dead
+    rig.location.y = 0.0; rig.keyframe_insert("location", index=1, frame=1)
+    rig.location.y = 0.03; rig.keyframe_insert("location", index=1, frame=4)
+    act = rig.animation_data.action
+    fcs = getattr(act, "fcurves", None)
+    if fcs is None:
+        from bpy_extras import anim_utils
+        fcs = anim_utils.action_get_channelbag_for_slot(act, rig.animation_data.action_slot).fcurves
+    for fc in fcs:
+        for kp in fc.keyframe_points:
+            kp.interpolation = 'LINEAR'
+    rig.location.y = 0.0
+    pbt = rig.pose.bones["Tip"]
+    helper = sjp._create_bone_jiggle(bpy.context, rig, pbt, 'JELLY', True)
+    if i == 4:   # rigs are offset sideways: the helper must still sit at the tip
+        bpy.context.view_layer.update()
+        gap = (helper.matrix_world.translation - rig.matrix_world @ pbt.tail).length
+        check("helper is placed at the bone tip on a moved rig", gap < 1e-5,
+              f"gap {gap*100:.4f} cm")
+    m = sjp._jiggle_modifiers(helper)[0]
+    sjp._set_value(m, m.node_group, "Gravity", 0.0)
+    sjp._set_value(m, m.node_group, "Stretch Amount", amount)
+    sjp._bone_constraint(pbt).bulge = volume
+    helper.update_tag()
+    rigs.append((amount, volume, rig))
+
+peak = {}
+for f in range(1, 41):
+    stretch_scene.frame_set(f)
+    dg = bpy.context.evaluated_depsgraph_get()
+    for amount, volume, rig in rigs:
+        pbe = rig.evaluated_get(dg).pose.bones["Tip"]
+        ratio = (pbe.tail - pbe.head).length / 0.2
+        thick = pbe.matrix.to_3x3().col[0].length
+        if abs(ratio - 1) > abs(peak.get((amount, volume), (1.0, 1.0))[0] - 1):
+            peak[(amount, volume)] = (ratio, thick)
+dev = {k: abs(v[0] - 1) for k, v in peak.items()}
+check("stretch scales with Stretch Amount (0x / 1x / 2x)",
+      dev[(1.0, 1.0)] > .01 and dev[(0.0, 1.0)] < .1 * dev[(1.0, 1.0)]
+      and abs(dev[(2.0, 1.0)] / dev[(1.0, 1.0)] - 2) < .2,
+      "peak length change " + ", ".join(f"amount {a:g}: {dev[(a, 1.0)]*100:.2f}%"
+                                        for a in (0.0, 1.0, 2.0)))
+thick_err = max(abs(peak[k][1] - peak[k][0] ** (-k[1] / 2)) for k in ((1.0, 0.0), (1.0, 1.0), (1.0, 2.0)))
+check("thickness follows Volume: length^(-Volume/2)", thick_err < .005,
+      "; ".join(f"Volume {k[1]:g}: length x{peak[k][0]:.3f}, thickness x{peak[k][1]:.3f}"
+                f" (expected x{peak[k][0] ** (-k[1] / 2):.3f})"
+                for k in ((1.0, 0.0), (1.0, 1.0), (1.0, 2.0))))
+pbv = rigs[4][2].pose.bones["Tip"]
+hv = sjp._bone_helper(pbv)
+bpy.context.view_layer.objects.active = rigs[4][2]
+bpy.ops.skin_jiggle.bone_stretch(bone_name="Tip")
+bpy.ops.skin_jiggle.bone_stretch(bone_name="Tip")
+check("Volume survives toggling Squash & Stretch off and on",
+      abs(sjp._bone_constraint(pbv).bulge - 2.0) < 1e-6,
+      f"bulge {sjp._bone_constraint(pbv).bulge}")
+
 print(f"SJ_BONES_SUMMARY {sum(results)}/{len(results)} passed")
 sjp.unregister()
 if not all(results):

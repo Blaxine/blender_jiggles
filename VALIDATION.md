@@ -1,4 +1,4 @@
-# Validation — version 1.12.0
+# Validation — version 1.13.0
 
 Validated with the installed Blender **4.1.1** and **5.1.2** executables using
 factory-startup background sessions. No existing user scenes were opened or
@@ -11,7 +11,7 @@ blender --background --factory-startup --python-exit-code 1 --python tests/check
 blender --background --factory-startup --python-exit-code 1 --python tests/check_bones.py
 ```
 
-`tests/check_bones.py` (15 checks, all passing on 4.1.1 and 5.1.2) covers
+`tests/check_bones.py` (19 checks, all passing on 4.1.1 and 5.1.2) covers
 jiggle bones: adding them in Pose Mode, helper parenting, all 29 presets
 converting to isotropic bone springs, contact style and Squash & Stretch
 toggles, a two-bone chain, swing frequency (Jelly: 2.99 Hz measured vs 3.00
@@ -19,10 +19,16 @@ Hz), a rig-deformed body with Collision excluded from colliders (no
 dependency cycle), a bone-parented hand collider keeping the tip's simulated
 point outside it, Reset All, removal, and baking from the armature (frames
 reached by jumping after the bake match normal playback exactly).
+Squash & Stretch is checked by jerking a rig 3 cm along the bone: peak
+length change 0.00 / 5.89 / 11.77 % at Stretch Amount 0 / 1 / 2 (exactly
+2x), and thickness at Volume 0 / 1 / 2 equal to (rest length / length)^
+(Volume/2) — 1.000 / 0.972 / 0.944 at 5.9 % stretch. Volume survives
+toggling Squash & Stretch, and helpers are placed exactly at the bone tip
+on a rig that was just moved.
 
 The regression script checks:
 
-- The generated 448-node graph builds and is reusable.
+- The generated 455-node graph builds and is reusable.
 - All 29 presets (25 body, 4 material) match their declared frequency and
   damping ratio, stay
   within every exposed parameter range, and avoid the stiffness stability

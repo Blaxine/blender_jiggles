@@ -1,4 +1,4 @@
-# Skin Jiggle Physics 1.12.0 — Blender 4.1+ Addon
+# Skin Jiggle Physics 1.13.0 — Blender 4.1+ Addon
 
 Vertex-group-driven soft tissue simulation built on **Geometry Nodes
 Simulation Zones**. Each jiggle layer is one Geometry Nodes modifier masked
@@ -105,6 +105,16 @@ For each bone the add-on sets up:
    Track** (rotate only) or, with **Squash & Stretch** on, **Stretch To**
    (the bone lengthens and shortens toward the point; good for Jelly and
    Bouncing Ball).
+
+**Squash & Stretch controls** (shown when it is on):
+
+| Control | Effect |
+|---|---|
+| **Stretch Amount** | Scales only the motion along the bone. 0 = no stretch, 1 = what the physics gives, 2 = twice as much. Swing is unchanged, and stretch stays proportional to how hard the bone is moved. |
+| **Volume** | How thickness responds: 0 = keeps its thickness, 1 = keeps its volume (thinner when stretched, fatter when squashed), 2+ = exaggerated cartoon bulge. Thickness scales by (rest length / length)^(Volume/2). |
+
+Max Stretch still caps the total travel, so a large Stretch Amount can't
+stretch a bone without limit.
 
 The armature's Jiggle tab lists its jiggle bones; click one to edit its
 preset, contact style, Strength and settings, or **×** to remove it (the
@@ -407,6 +417,14 @@ start frame, which clears the live cache.
 - The generated node group `SkinJiggleCore` is shared by all layers; the
   node layout is auto-generated (a grid) but fully inspectable/editable
   if you want to extend it.
+
+## Upgrading to 1.13.0
+
+- Install `dist/skin_jiggle_physics_1.13.0.zip` and press **Upgrade Layers**
+  on armatures with jiggle bones to get **Stretch Amount**; **Volume** works
+  on existing Squash & Stretch bones right away.
+- Fixes jiggle bones added right after an armature was moved (e.g. by a
+  script): the helper point was placed where the bone tip used to be.
 
 ## Upgrading to 1.12.0
 

@@ -37,7 +37,7 @@
 bl_info = {
     "name": "Skin Jiggle Physics",
     "author": "Claude (Anthropic)",
-    "version": (1, 12, 0),
+    "version": (1, 13, 0),
     "blender": (4, 1, 0),
     "location": "3D Viewport > Sidebar (N) > Jiggle",
     "description": "High-end vertex-group soft tissue / skin jiggle physics "
@@ -55,7 +55,7 @@ from mathutils import Matrix
 
 CORE_NAME = "SkinJiggleCore"
 SJ_COLL = "SJ_Colliders"
-BUILD_TAG = "1.12.0"
+BUILD_TAG = "1.13.0"
 _LOG = logging.getLogger(__name__)
 SAG_FRACTION = 0.5   # gravity sag may use at most this share of Max Stretch
 
@@ -134,6 +134,10 @@ _SOCKET_DEFS = [
      "How much FURTHER than Max Stretch a collider may push the skin. "
      "Raise it if skin still clips into a collider; Max Stretch then "
      "keeps limiting only the jiggle"),
+    ("Stretch Amount", 'NodeSocketFloat', 1.0, 0.0, 5.0, 'NONE',
+     "Scales the jiggle along the surface normal only. On a jiggle bone "
+     "that is the bone's axis, so this is the squash & stretch amount: "
+     "0 = none, 1 = what the physics gives, 2 = twice as much"),
 ]
 
 # Collapsible sections of the active layer: (id, label, icon, inputs)
@@ -1093,6 +1097,17 @@ def _build_core_group():
                           MT('MAXIMUM', weight_blur.outputs['Value'], 1e-6)))
     # vertices resting on a contact keep their exact collision-resolved
     # offset: averaging with free neighbours would pull them into the collider
+    # Stretch Amount: scale only the part of the jiggle along the normal
+    # (a jiggle bone's axis), so squash & stretch can be tuned separately
+    # from the swing. Applied before the contact switch: contacts keep
+    # their exact resolved offset.
+    n_post = VM('NORMALIZE', nodes.new('GeometryNodeInputNormal').outputs[0])
+    along = VM('DOT_PRODUCT', smooth_offset, n_post)
+    smooth_offset = VM('ADD', smooth_offset,
+                       VM('SCALE', n_post,
+                          MT('MULTIPLY', along,
+                             MT('SUBTRACT', gi_post.outputs['Stretch Amount'],
+                                1.0))))
     touch_now = SAMPLE(ZS(sim_out.outputs), NATTR("sj_touch", 'BOOLEAN'),
                        idx2, dtype='BOOLEAN')
     smooth_offset = SWITCHV(touch_now, smooth_offset, offset)
@@ -1546,6 +1561,10 @@ def _create_bone_jiggle(context, arm, pb, preset, stretch):
     """Helper point at the bone's tail, parented to the bone's PARENT (so it
     follows the animation without depending on the jiggled bone), driven by
     an ordinary jiggle layer. The bone then aims at the simulated point."""
+    # matrix_world / pose matrices can be stale right after the armature was
+    # moved; a stale tail puts the helper beside the bone, which then aims
+    # (and measures its stretch rest length) at the wrong point
+    context.view_layer.update()
     tail = arm.matrix_world @ pb.tail
     rot = (arm.matrix_world @ pb.matrix).to_quaternion()
     size = max(pb.bone.length * max(arm.matrix_world.to_scale()) * 0.03, 0.002)
@@ -1581,6 +1600,8 @@ def _create_bone_jiggle(context, arm, pb, preset, stretch):
 def _set_bone_constraint(pb, helper, stretch):
     old = _bone_constraint(pb)
     if old is not None:
+        if old.type == 'STRETCH_TO':
+            helper["sj_volume"] = old.bulge    # survives toggling stretch off
         pb.constraints.remove(old)
     con = pb.constraints.new('STRETCH_TO' if stretch else 'DAMPED_TRACK')
     con.name = SJ_BONE_CON
@@ -1588,7 +1609,10 @@ def _set_bone_constraint(pb, helper, stretch):
     con.subtarget = SJ_TIP_GROUP
     if stretch:
         con.rest_length = 0.0      # Blender measures it on first evaluation
+        # thickness scales by (rest/length)^(Volume/2) on X and Z:
+        # Volume 0 keeps thickness, 1 keeps volume, more exaggerates
         con.volume = 'VOLUME_XZX'
+        con.bulge = helper.get("sj_volume", 1.0)
     else:
         con.track_axis = 'TRACK_Y'
     return con
@@ -2686,12 +2710,23 @@ def _draw_layer_settings(layout, obj, mod, pb=None):
             op = row.operator("skin_jiggle.cage_delete", text="", icon='TRASH')
             op.modifier_name = mod.name
     else:
-        stretch = _bone_constraint(pb).type == 'STRETCH_TO'
+        con = _bone_constraint(pb)
+        stretch = con.type == 'STRETCH_TO'
         op = row.operator("skin_jiggle.bone_stretch",
                           text="Squash & Stretch: On" if stretch
                           else "Squash & Stretch",
                           icon='CON_STRETCHTO', depress=stretch)
         op.bone_name = pb.name
+        if stretch:
+            col = layout.column(align=True)
+            ident = ident_map.get("Stretch Amount")
+            if ident is not None:
+                col.prop(mod, f'["{ident}"]', text="Stretch Amount")
+            col.prop(con, "bulge", text="Volume")
+            tip = layout.column(align=True)
+            tip.scale_y = 0.8
+            tip.label(text="Volume 0: same thickness,", icon='INFO')
+            tip.label(text="1: keeps volume, 2+: cartoon.", icon='BLANK1')
 
     for sid, label, icon, names in _LAYER_SECTIONS:
         if pb is not None and sid == "folds":

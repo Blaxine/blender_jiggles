@@ -1,4 +1,4 @@
-# Skin Jiggle Physics 1.12.0 — preset calibration
+# Skin Jiggle Physics 1.13.0 — preset calibration
 
 These are plausible animation starting points for an adult human at actual
 scale, with **one Blender world unit equal to one metre** (Scene Unit Scale 1).
@@ -164,7 +164,7 @@ Reach rather than Max Stretch, so the jiggle keeps its limit. Partial Blend
 
 ## Upgrade
 
-Install version 1.12.0 and select **Upgrade Layers** on existing objects. This
+Install version 1.13.0 and select **Upgrade Layers** on existing objects. This
 rebuilds their engine and associated cages while preserving settings. It does
 not silently replace shot-specific tuning with the new presets. Reapply a
 preset explicitly to use this table, then delete old bakes and bake again.
