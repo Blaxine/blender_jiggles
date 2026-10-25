@@ -1,4 +1,4 @@
-# Validation — version 1.10.0
+# Validation — version 1.12.0
 
 Validated with the installed Blender **4.1.1** and **5.1.2** executables using
 factory-startup background sessions. No existing user scenes were opened or
@@ -8,12 +8,23 @@ Run from the repository root (replace `blender` with the installed executable):
 
 ```text
 blender --background --factory-startup --python-exit-code 1 --python tests/check_blender.py
+blender --background --factory-startup --python-exit-code 1 --python tests/check_bones.py
 ```
+
+`tests/check_bones.py` (15 checks, all passing on 4.1.1 and 5.1.2) covers
+jiggle bones: adding them in Pose Mode, helper parenting, all 29 presets
+converting to isotropic bone springs, contact style and Squash & Stretch
+toggles, a two-bone chain, swing frequency (Jelly: 2.99 Hz measured vs 3.00
+Hz), a rig-deformed body with Collision excluded from colliders (no
+dependency cycle), a bone-parented hand collider keeping the tip's simulated
+point outside it, Reset All, removal, and baking from the armature (frames
+reached by jumping after the bake match normal playback exactly).
 
 The regression script checks:
 
 - The generated 448-node graph builds and is reusable.
-- All 25 presets match their declared frequency and damping ratio, stay
+- All 29 presets (25 body, 4 material) match their declared frequency and
+  damping ratio, stay
   within every exposed parameter range, and avoid the stiffness stability
   clamp at 24 fps with their normal-quality substep settings.
 - Actual evaluated simulation advances across frames.
@@ -42,11 +53,19 @@ helper collections during a dependency-graph rebuild. Empty scenes now do no
 collision work; structural collider changes are deferred to the repair timer.
 The complete suite passes after that change.
 
-The live 100-profile collision sweep is documented in
+The live 116-profile collision sweep is documented in
 [COLLISION_TESTS.md](COLLISION_TESTS.md). Since 1.10.0 it measures no
 penetration in any profile (1.9.0: up to 11 mm). Contacts are still sampled
 once per frame, so very fast presses against thin colliders remain an
 approximation.
+
+The four material presets were also measured in a free-response test (a
+weighted grid stopping dead along its normal) on both Blender versions:
+Jelly 2.99 Hz / 73 % amplitude kept per cycle (spec 3.00 Hz / 73 %),
+Pudding 1.18 Hz / 39 % (1.19 / 39 %), Bouncing Ball 3.48 Hz / 69 %
+(3.50 / 72 %), Water Bed 0.40 Hz / 47 % (0.40 / 47 %). See
+[PRESET_REALISM.md](PRESET_REALISM.md#material-presets) for how the targets
+were derived.
 
 The 1.10.0 panel was checked by opening Blender 4.1.1 and 5.1.2 with a test
 scene and screenshotting the Jiggle sidebar (layer list, Layer Settings,

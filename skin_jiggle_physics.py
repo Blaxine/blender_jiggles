@@ -37,7 +37,7 @@
 bl_info = {
     "name": "Skin Jiggle Physics",
     "author": "Claude (Anthropic)",
-    "version": (1, 10, 0),
+    "version": (1, 12, 0),
     "blender": (4, 1, 0),
     "location": "3D Viewport > Sidebar (N) > Jiggle",
     "description": "High-end vertex-group soft tissue / skin jiggle physics "
@@ -49,12 +49,13 @@ import bpy
 import math
 import logging
 from bpy.types import Operator, Panel
-from bpy.props import EnumProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, StringProperty
 from bpy.app.handlers import persistent
+from mathutils import Matrix
 
 CORE_NAME = "SkinJiggleCore"
 SJ_COLL = "SJ_Colliders"
-BUILD_TAG = "1.10.0"
+BUILD_TAG = "1.12.0"
 _LOG = logging.getLogger(__name__)
 SAG_FRACTION = 0.5   # gravity sag may use at most this share of Max Stretch
 
@@ -207,6 +208,21 @@ _PRESET_SPECS = {
     'THIGH_TIGHT': ('Thighs — Tight', 9.0, .50, .18, .15, .010, 10, .20, .15, .03),
     'BELLY_SOFT': ('Belly — Soft', 2.0, .45, .80, .60, .060, 6, .50, .60, .05),
     'BELLY_FIRM': ('Belly — Firm', 4.5, .55, .40, .35, .025, 6, .30, .30, .03),
+    # ------------------------------------------------------- materials
+    # Derived from material data; see PRESET_REALISM.md for the sources.
+    # Jelly: shear-wave wobble of a 6-8 cm gelatin block (G ~0.6-1.2 kPa)
+    # is 2.4-4.4 Hz; an elastic gel's tan(delta) ~0.1 gives zeta 0.05.
+    'JELLY': ('Jelly', 3.0, .05, .30, .10, .040, 6, .60, .60, .30),
+    # Pudding: starch weak gel, G' ~80-140 Pa -> 1.0-1.8 Hz; tan(delta)
+    # ~0.3 -> zeta 0.15.
+    'PUDDING': ('Pudding', 1.2, .15, .30, .30, .050, 6, .70, 1.0, .02),
+    # Bouncing ball: zeta from restitution 0.85 (rebound to 72 % of the
+    # drop). Real squash rings at ~100 Hz; slowed to 3.5 Hz to be visible.
+    'BOUNCING_BALL': ('Bouncing Ball (Stylized)', 3.5, .052, .30, .60, .050,
+                      6, .50, .80, .85),
+    # Water bed: first slosh modes of an 84 x 60-72 in, 8-10 in deep
+    # mattress are 0.32-0.48 Hz; waves fading over ~7.5 s give zeta 0.12.
+    'WATER_BED': ('Water Bed', 0.4, .12, .30, .80, .080, 6, .80, 1.0, .05),
 }
 
 # Per-body defaults: added skin clearance (m), collider-friction multiplier,
@@ -238,6 +254,10 @@ _CONTACT_PRESET_BASE = {
     'THIGH_TIGHT': (.0008, .38, .16, .01, 2),
     'BELLY_SOFT': (.0030, .70, .70, .04, 4),
     'BELLY_FIRM': (.0015, .50, .32, .02, 3),
+    'JELLY': (.0020, .30, .60, .30, 4),          # slippery, springy rebound
+    'PUDDING': (.0020, .60, 1.0, .02, 5),        # sticky, bulges, no rebound
+    'BOUNCING_BALL': (.0015, .50, .80, .85, 4),  # restitution 0.85
+    'WATER_BED': (.0030, .30, 1.0, .05, 8),      # wide displacement ring
 }
 
 _CONTACT_STYLES = [
@@ -272,6 +292,7 @@ _PRESET_GROUPS = [
     ("Glutes", ['GLUTE_SOFT', 'GLUTE_TIGHT', 'GLUTE_FIRM']),
     ("Thighs", ['THIGH_SOFT', 'THIGH_FIRM', 'THIGH_TIGHT']),
     ("Belly", ['BELLY_SOFT', 'BELLY_FIRM']),
+    ("Materials", ['JELLY', 'PUDDING', 'BOUNCING_BALL', 'WATER_BED']),
 ]
 
 def _build_preset_enum():
@@ -1238,10 +1259,22 @@ def _is_collider(ob):
     """Meshes with Physics > Collision enabled, EXCEPT jiggled objects and
     cages: a layer reading its own object would be refused by Collection
     Info (killing all collision for that layer), and two jiggled objects
-    reading each other form a dependency cycle."""
+    reading each other form a dependency cycle. The same cycle forms for a
+    mesh deformed by an armature with jiggle bones (helper -> collider
+    mesh -> armature -> bone constraint -> helper)."""
     return (ob.type == 'MESH' and ob.collision is not None
             and ob.collision.use and not _jiggle_modifiers(ob)
-            and not ob.get("sj_cage_src"))
+            and not ob.get("sj_cage_src")
+            and not _deformed_by_jiggle_rig(ob))
+
+
+def _deformed_by_jiggle_rig(ob):
+    for m in ob.modifiers:
+        if (m.type == 'ARMATURE' and m.object is not None
+                and m.object.get("sj_jiggle_bones")):
+            return True
+    return (ob.parent is not None and ob.parent_type == 'ARMATURE'
+            and bool(ob.parent.get("sj_jiggle_bones")))
 
 
 def _sync_colliders(scene, force=False):
@@ -1414,7 +1447,15 @@ def _sj_depsgraph_watch(scene, depsgraph=None):
             bpy.app.timers.register(_repair_timer, first_interval=0.0)
 
 def _apply_preset(mod, ng, preset_key):
-    for name, value in PRESETS[preset_key][1].items():
+    values = dict(PRESETS[preset_key][1])
+    if mod.get('sj_bone'):
+        # A bone tip has no surface: make the spring isotropic at the
+        # preset's normal-mode stiffness, so the bone swings at exactly the
+        # preset's frequency in every direction. Folds need a surface.
+        values['Stiffness'] *= max(1.0 - values['Normal Softness'], 0.02)
+        values['Normal Softness'] = 0.0
+        values['Fold Smoothing'] = 0.0
+    for name, value in values.items():
         _set_value(mod, ng, name, value)
     mod['sj_body_preset'] = preset_key
     mod['sj_contact_style'] = 'BODY'
@@ -1446,6 +1487,127 @@ def _refresh(obj):
     obj.update_tag()
     for wm_area in bpy.context.screen.areas if bpy.context.screen else []:
         wm_area.tag_redraw()
+
+
+def _create_layer(context, obj, group, preset, bone=False):
+    """Add a jiggle layer to obj driven by a vertex group. Returns
+    (modifier, collider count, name of the modifier it was placed before)."""
+    ng = _build_core_group()
+    mod = obj.modifiers.new(name=f"SkinJiggle_{group}", type='NODES')
+    mod.node_group = ng
+    if bone:
+        mod['sj_bone'] = True     # before the preset: it converts for bones
+    _set_vertex_group(mod, ng, group)
+    _apply_preset(mod, ng, preset)
+    _set_object(mod, ng, "Reference Object", _ensure_ref_empty(obj))
+    col, n_col = _sync_colliders(context.scene, force=True)
+    _set_object(mod, ng, "Collider Collection", col)
+    _set_value(mod, ng, "Animation Mode", bool(context.scene.sj_anim_mode))
+    mod.show_expanded = False
+    placed = _place_before_subdivision(context, obj, mod)
+    obj.sj_active_layer = list(obj.modifiers).index(mod)
+    _refresh(obj)
+    return mod, n_col, placed
+
+
+# ---------------------------------------------------------------------------
+#  Jiggle bones: the bone aims at a helper point driven by a normal layer
+# ---------------------------------------------------------------------------
+SJ_BONE_CON = "SJ Jiggle"
+SJ_TIP_GROUP = "SJ_Tip"
+
+
+def _bone_constraint(pb):
+    return next((c for c in pb.constraints if c.name == SJ_BONE_CON
+                 and c.type in {'DAMPED_TRACK', 'STRETCH_TO'}), None)
+
+
+def _bone_helper(pb):
+    con = _bone_constraint(pb)
+    helper = con.target if con is not None else None
+    return helper if helper is not None and helper.get("sj_bone_helper") else None
+
+
+def _jiggle_bones(arm):
+    return [pb for pb in arm.pose.bones if _bone_helper(pb) is not None]
+
+
+def _layer_objects(obj):
+    """Objects whose jiggle layers belong to obj: itself, or for an
+    armature the helper points of its jiggle bones."""
+    if obj is None:
+        return []
+    if obj.type == 'ARMATURE':
+        return [_bone_helper(pb) for pb in _jiggle_bones(obj)]
+    return [obj]
+
+
+def _create_bone_jiggle(context, arm, pb, preset, stretch):
+    """Helper point at the bone's tail, parented to the bone's PARENT (so it
+    follows the animation without depending on the jiggled bone), driven by
+    an ordinary jiggle layer. The bone then aims at the simulated point."""
+    tail = arm.matrix_world @ pb.tail
+    rot = (arm.matrix_world @ pb.matrix).to_quaternion()
+    size = max(pb.bone.length * max(arm.matrix_world.to_scale()) * 0.03, 0.002)
+    me = bpy.data.meshes.new(f"SJBone_{arm.name}_{pb.name}")
+    # small quad across the bone; its 4 points move together
+    me.from_pydata([(-size, 0, -size), (size, 0, -size), (size, 0, size),
+                    (-size, 0, size)], [], [(0, 1, 2, 3)])
+    helper = bpy.data.objects.new(me.name, me)
+    _editable_collection(arm, context.scene).objects.link(helper)
+    world = Matrix.Translation(tail) @ rot.to_matrix().to_4x4()
+    helper.parent = arm
+    if pb.parent is not None:
+        helper.parent_type = 'BONE'
+        helper.parent_bone = pb.parent.name
+    context.view_layer.update()
+    helper.matrix_world = world
+    vg = helper.vertex_groups.new(name=SJ_TIP_GROUP)
+    vg.add(range(4), 1.0, 'REPLACE')
+    helper["sj_bone_helper"] = True
+    helper["sj_bone_arm"] = arm
+    helper["sj_bone_name"] = pb.name
+    helper.display_type = 'WIRE'
+    helper.hide_render = True
+    helper.hide_select = True
+    _create_layer(context, helper, SJ_TIP_GROUP, preset, bone=True)
+    helper.hide_viewport = True
+    _set_bone_constraint(pb, helper, stretch)
+    arm["sj_jiggle_bones"] = True
+    arm.update_tag()
+    return helper
+
+
+def _set_bone_constraint(pb, helper, stretch):
+    old = _bone_constraint(pb)
+    if old is not None:
+        pb.constraints.remove(old)
+    con = pb.constraints.new('STRETCH_TO' if stretch else 'DAMPED_TRACK')
+    con.name = SJ_BONE_CON
+    con.target = helper
+    con.subtarget = SJ_TIP_GROUP
+    if stretch:
+        con.rest_length = 0.0      # Blender measures it on first evaluation
+        con.volume = 'VOLUME_XZX'
+    else:
+        con.track_axis = 'TRACK_Y'
+    return con
+
+
+def _remove_bone_jiggle(arm, pb):
+    helper = _bone_helper(pb)
+    con = _bone_constraint(pb)
+    if con is not None:
+        pb.constraints.remove(con)
+    if helper is not None:
+        _cleanup_ref_empty(helper)
+        data = helper.data
+        bpy.data.objects.remove(helper, do_unlink=True)
+        if data.users == 0:
+            bpy.data.meshes.remove(data)
+    if not _jiggle_bones(arm) and "sj_jiggle_bones" in arm:
+        del arm["sj_jiggle_bones"]
+    arm.update_tag()
 
 
 # ===========================================================================
@@ -1503,27 +1665,13 @@ class SJ_OT_add_layer(Operator):
                         f"this object — pick one from the search field")
             return {'CANCELLED'}
         try:
-            ng = _build_core_group()
+            mod, n_col, placed = _create_layer(context, obj,
+                                               self.vertex_group, self.preset)
         except Exception as exc:
             self.report({'ERROR'},
                         f"Failed to build node group (Blender 4.1+ "
                         f"required): {exc}")
             return {'CANCELLED'}
-
-        mod = obj.modifiers.new(name=f"SkinJiggle_{self.vertex_group}",
-                                type='NODES')
-        mod.node_group = ng
-        _set_vertex_group(mod, ng, self.vertex_group)
-        _apply_preset(mod, ng, self.preset)
-        _set_object(mod, ng, "Reference Object", _ensure_ref_empty(obj))
-        col, n_col = _sync_colliders(context.scene, force=True)
-        _set_object(mod, ng, "Collider Collection", col)
-        _set_value(mod, ng, "Animation Mode",
-                   bool(context.scene.sj_anim_mode))
-        mod.show_expanded = False
-        placed = _place_before_subdivision(context, obj, mod)
-        obj.sj_active_layer = list(obj.modifiers).index(mod)
-        _refresh(obj)
         self.report({'INFO'},
                     f"Jiggle layer added for '{self.vertex_group}' "
                     f"({n_col} collider(s) detected"
@@ -1616,18 +1764,18 @@ class SJ_OT_apply_preset(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     modifier_name: StringProperty()
+    object_name: StringProperty(options={'HIDDEN'})
     preset: EnumProperty(name="Preset", items=_PRESET_ENUM,
                          default='SOFT_SKIN')
 
     def invoke(self, context, event):
-        mod = context.object.modifiers.get(self.modifier_name)
+        _obj, mod = _target_layer(context, self.object_name, self.modifier_name)
         if mod is not None and mod.get('sj_body_preset') in PRESETS:
             self.preset = mod['sj_body_preset']   # open on the current one
         return context.window_manager.invoke_props_dialog(self)
 
     def execute(self, context):
-        obj = context.object
-        mod = obj.modifiers.get(self.modifier_name)
+        obj, mod = _target_layer(context, self.object_name, self.modifier_name)
         if mod and mod.node_group:
             _apply_preset(mod, mod.node_group, self.preset)
             _refresh(obj)
@@ -1641,19 +1789,18 @@ class SJ_OT_contact_style(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     modifier_name: StringProperty()
+    object_name: StringProperty(options={'HIDDEN'})
     style: EnumProperty(name='Style', items=_CONTACT_STYLES, default='BODY')
 
     def invoke(self, context, event):
-        obj, mod = _resolve_layer(context)
+        _obj, mod = _target_layer(context, self.object_name, self.modifier_name)
         if mod is not None:
             self.modifier_name = mod.name
             self.style = mod.get('sj_contact_style', 'BODY')
         return context.window_manager.invoke_props_dialog(self, width=340)
 
     def execute(self, context):
-        obj, mod = _resolve_layer(context)
-        if mod is None:
-            mod = obj.modifiers.get(self.modifier_name) if obj else None
+        obj, mod = _target_layer(context, self.object_name, self.modifier_name)
         if mod is None or not mod.node_group:
             self.report({'ERROR'}, 'Jiggle layer not found')
             return {'CANCELLED'}
@@ -1967,7 +2114,7 @@ class SJ_OT_upgrade_layers(Operator):
 
     @classmethod
     def poll(cls, context):
-        return context.object and _old_layers(context.object)
+        return any(_old_layers(o) for o in _layer_objects(context.object))
 
     def execute(self, context):
         obj = context.object
@@ -1976,7 +2123,7 @@ class SJ_OT_upgrade_layers(Operator):
         except Exception as exc:
             self.report({'ERROR'}, f"Failed to build node group: {exc}")
             return {'CANCELLED'}
-        mods = _old_layers(obj)
+        mods = [m for o in _layer_objects(obj) for m in _old_layers(o)]
         for mod in list(mods):
             cage = _layer_cage(mod)
             if cage is not None:
@@ -2021,12 +2168,12 @@ class SJ_OT_reset_defaults(Operator):
 
     @classmethod
     def poll(cls, context):
-        return context.object and _jiggle_modifiers(context.object)
+        return any(_jiggle_modifiers(o) for o in _layer_objects(context.object))
 
     def execute(self, context):
         obj = context.object
         count = 0
-        for mod in _jiggle_modifiers(obj):
+        for mod in [m for o in _layer_objects(obj) for m in _jiggle_modifiers(o)]:
             ng = mod.node_group
             for item in ng.interface.items_tree:
                 if (getattr(item, "item_type", "") != 'SOCKET'
@@ -2045,7 +2192,12 @@ class SJ_OT_reset_defaults(Operator):
                         mod[item.identifier] = float(default)
                 except (TypeError, KeyError):
                     pass
+            if mod.get('sj_bone'):
+                # factory = Soft Skin; bone tips need its isotropic form
+                _apply_preset(mod, ng, 'SOFT_SKIN')
             count += 1
+        for o in _layer_objects(obj):
+            o.update_tag()
         _refresh(obj)
         self.report({'INFO'},
                     f"{count} layer(s) reset to factory defaults")
@@ -2062,14 +2214,54 @@ class SJ_OT_reset(Operator):
         return {'FINISHED'}
 
 
-def _call_cache_operator(operator):
+def _call_cache_operator(operator, selected=False):
     """Keep compatibility retries within the caller's error handler."""
     try:
-        result = operator(selected=False)
+        result = operator(selected=selected)
     except TypeError:
         result = operator()
     if 'FINISHED' not in result:
         raise RuntimeError('Blender cancelled the cache operation; check the console')
+
+
+def _ensure_bake_dirs(objects):
+    """Give every layer its own bake folder. Modifiers created from Python
+    start with an empty one, and Blender 4.1 then 'bakes' without writing
+    anything. Layers share one node group, hence one bake id, so the folder
+    must be unique per object and layer or they would overwrite each other."""
+    for ob in objects:
+        for mod in _jiggle_modifiers(ob):
+            if hasattr(mod, "bake_directory") and not mod.bake_directory:
+                mod.bake_directory = (f"//sj_bake/{bpy.path.clean_name(ob.name)}"
+                                      f"_{bpy.path.clean_name(mod.name)}/")
+
+
+def _run_cache_operator(context, operator):
+    """Bake/free the active object, or for an armature all helper points
+    of its jiggle bones (they hold the simulations)."""
+    obj = context.object
+    _ensure_bake_dirs(_layer_objects(obj))
+    if obj is not None and obj.type == 'ARMATURE':
+        helpers = [o for o in _layer_objects(obj) if _jiggle_modifiers(o)]
+        if not helpers:
+            raise RuntimeError("This armature has no jiggle bones")
+        # Blender's cache operators refuse hidden objects: show the helper
+        # points only while the operator runs
+        hidden = [h for h in helpers if h.hide_viewport]
+        for h in hidden:
+            h.hide_viewport = False
+        context.view_layer.update()
+        try:
+            with context.temp_override(selected_objects=helpers,
+                                       selected_editable_objects=helpers,
+                                       active_object=helpers[0],
+                                       object=helpers[0]):
+                _call_cache_operator(operator, selected=True)
+        finally:
+            for h in hidden:
+                h.hide_viewport = True
+        return
+    _call_cache_operator(operator)
 
 
 class SJ_OT_bake(Operator):
@@ -2079,11 +2271,11 @@ class SJ_OT_bake(Operator):
 
     @classmethod
     def poll(cls, context):
-        return context.object and _jiggle_modifiers(context.object)
+        return any(_jiggle_modifiers(o) for o in _layer_objects(context.object))
 
     def execute(self, context):
         try:
-            _call_cache_operator(bpy.ops.object.simulation_nodes_cache_bake)
+            _run_cache_operator(context, bpy.ops.object.simulation_nodes_cache_bake)
         except Exception as exc:
             self.report({'ERROR'}, f"Bake failed: {exc}")
             return {'CANCELLED'}
@@ -2098,10 +2290,159 @@ class SJ_OT_free_bake(Operator):
 
     def execute(self, context):
         try:
-            _call_cache_operator(bpy.ops.object.simulation_nodes_cache_delete)
+            _run_cache_operator(context, bpy.ops.object.simulation_nodes_cache_delete)
         except Exception as exc:
             self.report({'ERROR'}, f"Delete failed: {exc}")
             return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+def _target_layer(context, object_name, modifier_name):
+    """(object, layer) an operator acts on: the named object (a bone's
+    helper point), a cage's source layer, or the active object's layer."""
+    obj = bpy.data.objects.get(object_name) if object_name else None
+    if obj is None:
+        obj, mod = _resolve_layer(context)
+        if mod is not None:
+            return obj, mod
+    return obj, (obj.modifiers.get(modifier_name) if obj else None)
+
+
+def _selected_bones(context):
+    bones = list(context.selected_pose_bones or [])
+    if not bones and context.active_pose_bone is not None:
+        bones = [context.active_pose_bone]
+    if not bones and context.object and context.object.type == 'ARMATURE':
+        active = context.object.data.bones.active
+        if active is not None:
+            bones = [context.object.pose.bones[active.name]]
+    return bones
+
+
+class SJ_OT_add_bone_jiggle(Operator):
+    """Make the selected bones jiggle with a preset. Each bone aims at a
+    hidden helper point at its tip that is simulated exactly like a jiggle
+    layer (same presets, collisions and Contact Reach)"""
+    bl_idname = "skin_jiggle.add_bone_jiggle"
+    bl_label = "Add Jiggle to Selected Bones"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    preset: EnumProperty(name="Preset", items=_PRESET_ENUM, default='SOFT_SKIN')
+    stretch: BoolProperty(
+        name="Stretch",
+        description="Let the bone squash and stretch toward its tip "
+                    "(Stretch To) instead of only rotating (Damped Track)",
+        default=False)
+
+    @classmethod
+    def poll(cls, context):
+        o = context.object
+        if o and o.library is not None:
+            cls.poll_message_set("Linked armature: make it a library "
+                                 "override first")
+            return False
+        return o is not None and o.type == 'ARMATURE'
+
+    def invoke(self, context, event):
+        if not _selected_bones(context):
+            self.report({'ERROR'}, "Select the bones to jiggle (Pose Mode)")
+            return {'CANCELLED'}
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        arm = context.object
+        bones = _selected_bones(context)
+        if not bones:
+            self.report({'ERROR'}, "Select the bones to jiggle (Pose Mode)")
+            return {'CANCELLED'}
+        added, skipped = [], []
+        try:
+            for pb in bones:
+                if _bone_constraint(pb) is not None:
+                    skipped.append(pb.name)
+                    continue
+                _create_bone_jiggle(context, arm, pb, self.preset, self.stretch)
+                added.append(pb.name)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not add jiggle bone: {exc}")
+            _LOG.exception("Could not add jiggle bone")
+            return {'CANCELLED'}
+        if added:
+            arm.data.bones.active = arm.data.bones[added[-1]]
+        _sync_colliders(context.scene, force=True)
+        _refresh(arm)
+        msg = f"{len(added)} jiggle bone(s) added"
+        if skipped:
+            msg += f"; already jiggling: {', '.join(skipped)}"
+        self.report({'INFO'}, msg + ". Play the timeline to simulate.")
+        return {'FINISHED'}
+
+
+class SJ_OT_remove_bone_jiggle(Operator):
+    """Stop this bone jiggling: removes its constraint and helper point"""
+    bl_idname = "skin_jiggle.remove_bone_jiggle"
+    bl_label = "Remove Bone Jiggle"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    bone_name: StringProperty()
+
+    def execute(self, context):
+        arm = context.object
+        pb = arm.pose.bones.get(self.bone_name) if arm and arm.type == 'ARMATURE' else None
+        if pb is None:
+            return {'CANCELLED'}
+        _remove_bone_jiggle(arm, pb)
+        _sync_colliders(context.scene, force=True)
+        _refresh(arm)
+        return {'FINISHED'}
+
+
+class SJ_OT_select_bone(Operator):
+    """Select this jiggle bone to edit its settings"""
+    bl_idname = "skin_jiggle.select_bone"
+    bl_label = "Select Jiggle Bone"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    bone_name: StringProperty()
+
+    def execute(self, context):
+        arm = context.object
+        bone = arm.data.bones.get(self.bone_name) if arm and arm.type == 'ARMATURE' else None
+        if bone is None:
+            return {'CANCELLED'}
+        arm.data.bones.active = bone
+        _select_bone(arm, bone.name)
+        _refresh(arm)
+        return {'FINISHED'}
+
+
+def _select_bone(arm, name):
+    # selection lives on Bone up to Blender 4.x, on PoseBone from 5.0
+    pb = arm.pose.bones.get(name)
+    if pb is not None and hasattr(pb, "select"):
+        pb.select = True
+    else:
+        arm.data.bones[name].select = True
+
+
+class SJ_OT_bone_stretch(Operator):
+    """Switch between rotating only (Damped Track) and squash & stretch
+    (Stretch To)"""
+    bl_idname = "skin_jiggle.bone_stretch"
+    bl_label = "Bone Stretch"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    bone_name: StringProperty()
+
+    def execute(self, context):
+        arm = context.object
+        pb = arm.pose.bones.get(self.bone_name) if arm and arm.type == 'ARMATURE' else None
+        helper = _bone_helper(pb) if pb is not None else None
+        if helper is None:
+            return {'CANCELLED'}
+        stretch = _bone_constraint(pb).type != 'STRETCH_TO'
+        _set_bone_constraint(pb, helper, stretch)
+        _refresh(arm)
         return {'FINISHED'}
 
 
@@ -2176,7 +2517,40 @@ class _SJPanel:
 
     @classmethod
     def poll(cls, context):
-        return context.object is not None and context.object.type == 'MESH'
+        return (context.object is not None
+                and context.object.type in {'MESH', 'ARMATURE'})
+
+
+def _draw_warnings(layout, context, obj):
+    if abs(context.scene.unit_settings.scale_length - 1.0) > 1e-6:
+        warning = layout.box()
+        warning.alert = True
+        warning.label(text='Presets assume 1 Blender unit = 1 metre', icon='ERROR')
+        warning.label(text='Use Unit Scale 1 and actual human dimensions')
+    if min(abs(v) for v in obj.scale) < 1e-6:
+        warning = layout.box()
+        warning.alert = True
+        warning.label(text='Zero object scale: restore a nonzero scale', icon='ERROR')
+    n_old = sum(len(_old_layers(o)) for o in _layer_objects(obj))
+    if n_old:
+        box = layout.box()
+        box.alert = True
+        box.label(text=f"{n_old} layer(s) use an older engine", icon='ERROR')
+        box.operator("skin_jiggle.upgrade_layers", icon='FILE_REFRESH')
+
+
+def _draw_anim_mode(layout, context):
+    row = layout.row(align=True)
+    row.scale_y = 1.3
+    row.prop(context.scene, "sj_anim_mode",
+             icon='PLAY' if not context.scene.sj_anim_mode
+             else 'RENDER_ANIMATION', toggle=True)
+
+
+def _active_jiggle_bone(arm):
+    active = arm.data.bones.active
+    pb = arm.pose.bones.get(active.name) if active is not None else None
+    return pb if pb is not None and _bone_helper(pb) is not None else None
 
 
 class VIEW3D_PT_skin_jiggle(_SJPanel, Panel):
@@ -2189,31 +2563,14 @@ class VIEW3D_PT_skin_jiggle(_SJPanel, Panel):
     def draw(self, context):
         layout = self.layout
         obj = context.object
-        if not obj or obj.type != 'MESH':
-            layout.label(text="Select a mesh object", icon='INFO')
+        if not obj or obj.type not in {'MESH', 'ARMATURE'}:
+            layout.label(text="Select a mesh or an armature", icon='INFO')
             return
-
-        if abs(context.scene.unit_settings.scale_length - 1.0) > 1e-6:
-            warning = layout.box()
-            warning.alert = True
-            warning.label(text='Presets assume 1 Blender unit = 1 metre', icon='ERROR')
-            warning.label(text='Use Unit Scale 1 and actual human dimensions')
-        if min(abs(v) for v in obj.scale) < 1e-6:
-            warning = layout.box()
-            warning.alert = True
-            warning.label(text='Zero object scale: restore a nonzero scale', icon='ERROR')
-        n_old = len(_old_layers(obj))
-        if n_old:
-            box = layout.box()
-            box.alert = True
-            box.label(text=f"{n_old} layer(s) use an older engine", icon='ERROR')
-            box.operator("skin_jiggle.upgrade_layers", icon='FILE_REFRESH')
-
-        row = layout.row(align=True)
-        row.scale_y = 1.3
-        row.prop(context.scene, "sj_anim_mode",
-                 icon='PLAY' if not context.scene.sj_anim_mode
-                 else 'RENDER_ANIMATION', toggle=True)
+        _draw_warnings(layout, context, obj)
+        _draw_anim_mode(layout, context)
+        if obj.type == 'ARMATURE':
+            self.draw_bones(context, obj)
+            return
 
         if not _jiggle_modifiers(obj):
             box = layout.box()
@@ -2237,27 +2594,46 @@ class VIEW3D_PT_skin_jiggle(_SJPanel, Panel):
                                icon='REMOVE')
             op.modifier_name = active.name
 
-
-class VIEW3D_PT_skin_jiggle_layer(_SJPanel, Panel):
-    bl_label = "Layer Settings"
-    bl_parent_id = "VIEW3D_PT_skin_jiggle"
-
-    @classmethod
-    def poll(cls, context):
-        return (super().poll(context)
-                and _active_layer(context.object) is not None)
-
-    def draw(self, context):
+    def draw_bones(self, context, arm):
         layout = self.layout
-        obj = context.object
-        mod = _active_layer(obj)
-        ident_map = _input_ident_map(mod.node_group)
+        bones = _jiggle_bones(arm)
+        if not bones:
+            box = layout.box()
+            col = box.column(align=True)
+            col.label(text="No jiggle bones yet", icon='INFO')
+            col.label(text="1. Select bones in Pose Mode")
+            col.label(text="2. Add jiggle to them")
+        else:
+            active = _active_jiggle_bone(arm)
+            col = layout.column(align=True)
+            for pb in bones:
+                # the preset is shown in Layer Settings: a second column
+                # would be cut off in a narrow sidebar
+                row = col.row(align=True)
+                op = row.operator("skin_jiggle.select_bone", text=pb.name,
+                                  icon='BONE_DATA', depress=pb == active)
+                op.bone_name = pb.name
+                op = row.operator("skin_jiggle.remove_bone_jiggle", text="",
+                                  icon='X')
+                op.bone_name = pb.name
+        row = layout.row()
+        row.scale_y = 1.3
+        row.operator("skin_jiggle.add_bone_jiggle",
+                     text="Jiggle Selected Bones", icon='ADD')
 
-        def labelled(text):
-            split = layout.split(factor=0.28, align=True)
-            split.label(text=text)
-            return split
 
+def _draw_layer_settings(layout, obj, mod, pb=None):
+    """Settings of one layer. With pb, the layer drives that jiggle bone:
+    no vertex group, cage, folds or normal softness, plus a Stretch toggle."""
+    ident_map = _input_ident_map(mod.node_group)
+    owner = obj.name if pb is not None else ""
+
+    def labelled(text):
+        split = layout.split(factor=0.28, align=True)
+        split.label(text=text)
+        return split
+
+    if pb is None:
         group = _layer_group(mod)
         missing = group not in obj.vertex_groups
         row = labelled("Group")
@@ -2267,30 +2643,38 @@ class VIEW3D_PT_skin_jiggle_layer(_SJPanel, Panel):
                           if missing else group,
                           icon='ERROR' if missing else 'GROUP_VERTEX')
         op.modifier_name = mod.name
-        row = labelled("Preset")
-        op = row.operator("skin_jiggle.apply_preset",
-                          text=_preset_label(mod), icon='PRESET')
-        op.modifier_name = mod.name
-        row = labelled("Contact")
-        style = mod.get('sj_contact_style', 'BODY')
-        op = row.operator('skin_jiggle.contact_style',
-                          text=next((label for ident, label, _ in _CONTACT_STYLES
-                                     if ident == style), 'Body preset'),
-                          icon='PHYSICS')
-        op.modifier_name = mod.name
+    else:
+        row = labelled("Bone")
+        row.label(text=pb.name, icon='BONE_DATA')
+    row = labelled("Preset")
+    op = row.operator("skin_jiggle.apply_preset",
+                      text=_preset_label(mod), icon='PRESET')
+    op.modifier_name = mod.name
+    op.object_name = owner
+    row = labelled("Contact")
+    style = mod.get('sj_contact_style', 'BODY')
+    op = row.operator('skin_jiggle.contact_style',
+                      text=next((label for ident, label, _ in _CONTACT_STYLES
+                                 if ident == style), 'Body preset'),
+                      icon='PHYSICS')
+    op.modifier_name = mod.name
+    op.object_name = owner
 
-        ident = ident_map.get("Blend")
-        if ident:
-            layout.prop(mod, f'["{ident}"]', text="Strength", slider=True)
+    ident = ident_map.get("Blend")
+    if ident:
+        layout.prop(mod, f'["{ident}"]', text="Strength", slider=True)
 
-        summary = _feel_summary(mod)
-        if summary:
-            col = layout.column(align=True)
-            col.scale_y = 0.85
-            col.label(text=summary[0], icon='FORCE_HARMONIC')
-            col.label(text=summary[1], icon='BLANK1')
+    summary = _feel_summary(mod)
+    if summary:
+        col = layout.column(align=True)
+        col.scale_y = 0.85
+        col.label(text=summary[0], icon='FORCE_HARMONIC')
+        col.label(text=summary[1] if pb is None
+                  else summary[1].replace("Jiggle travel", "Tip swing"),
+                  icon='BLANK1')
 
-        row = layout.row(align=True)
+    row = layout.row(align=True)
+    if pb is None:
         cage = _layer_cage(mod)
         cage_on = cage is not None and not cage.hide_viewport
         op = row.operator("skin_jiggle.cage_toggle",
@@ -2301,32 +2685,71 @@ class VIEW3D_PT_skin_jiggle_layer(_SJPanel, Panel):
         if cage is not None:
             op = row.operator("skin_jiggle.cage_delete", text="", icon='TRASH')
             op.modifier_name = mod.name
+    else:
+        stretch = _bone_constraint(pb).type == 'STRETCH_TO'
+        op = row.operator("skin_jiggle.bone_stretch",
+                          text="Squash & Stretch: On" if stretch
+                          else "Squash & Stretch",
+                          icon='CON_STRETCHTO', depress=stretch)
+        op.bone_name = pb.name
 
-        for sid, label, icon, names in _LAYER_SECTIONS:
-            # Limits stay open: Contact Reach is the fix for clipping skin
-            header, body = layout.panel(
-                f"sj_{sid}", default_closed=sid not in {"motion", "limits"})
-            header.label(text=label, icon=icon)
-            if body is None:
-                continue
-            # names inside full-width fields: split labels get cut off
-            # in a narrow sidebar ("Max Str...")
-            col = body.column(align=True)
-            for name in names:
-                ident = ident_map.get(name)
-                if ident is not None:
-                    col.prop(mod, f'["{ident}"]', text=name)
-            if sid == "limits":
-                tip = body.column(align=True)
-                tip.scale_y = 0.8
-                if ident_map.get("Contact Reach") is None:
-                    tip.label(text="Upgrade the layer to get Contact Reach",
-                              icon='ERROR')
-                else:
-                    tip.label(text="Skin clipping into a collider?", icon='INFO')
-                    tip.label(text="Raise Contact Reach.", icon='BLANK1')
-                    tip.label(text="Max Stretch: jiggle only.",
-                              icon='BLANK1')
+    for sid, label, icon, names in _LAYER_SECTIONS:
+        if pb is not None and sid == "folds":
+            continue
+        # Limits stay open: Contact Reach is the fix for clipping skin
+        header, body = layout.panel(
+            f"sj_{sid}", default_closed=sid not in {"motion", "limits"})
+        header.label(text=label, icon=icon)
+        if body is None:
+            continue
+        # names inside full-width fields: split labels get cut off
+        # in a narrow sidebar ("Max Str...")
+        col = body.column(align=True)
+        for name in names:
+            if pb is not None and name == "Normal Softness":
+                continue    # bone tips are isotropic
+            ident = ident_map.get(name)
+            if ident is not None:
+                col.prop(mod, f'["{ident}"]', text=name)
+        if sid == "limits":
+            tip = body.column(align=True)
+            tip.scale_y = 0.8
+            if ident_map.get("Contact Reach") is None:
+                tip.label(text="Upgrade the layer to get Contact Reach",
+                          icon='ERROR')
+            elif pb is not None:
+                tip.label(text="Max Stretch: how far the", icon='INFO')
+                tip.label(text="bone tip may swing.", icon='BLANK1')
+            else:
+                tip.label(text="Skin clipping into a collider?", icon='INFO')
+                tip.label(text="Raise Contact Reach.", icon='BLANK1')
+                tip.label(text="Max Stretch: jiggle only.",
+                          icon='BLANK1')
+
+
+class VIEW3D_PT_skin_jiggle_layer(_SJPanel, Panel):
+    bl_label = "Layer Settings"
+    bl_parent_id = "VIEW3D_PT_skin_jiggle"
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        if obj is None:
+            return False
+        if obj.type == 'ARMATURE':
+            return _active_jiggle_bone(obj) is not None
+        return obj.type == 'MESH' and _active_layer(obj) is not None
+
+    def draw(self, context):
+        obj = context.object
+        if obj.type == 'ARMATURE':
+            pb = _active_jiggle_bone(obj)
+            helper = _bone_helper(pb)
+            mods = _jiggle_modifiers(helper)
+            if mods:
+                _draw_layer_settings(self.layout, helper, mods[0], pb)
+            return
+        _draw_layer_settings(self.layout, obj, _active_layer(obj))
 
 
 class VIEW3D_PT_skin_jiggle_colliders(_SJPanel, Panel):
@@ -2374,10 +2797,11 @@ class VIEW3D_PT_skin_jiggle_sim(_SJPanel, Panel):
         row.operator("skin_jiggle.bake", icon='RENDER_ANIMATION')
         row.operator("skin_jiggle.free_bake", text="", icon='TRASH')
         layout.operator("skin_jiggle.reset_defaults", icon='LOOP_BACK')
-        col = layout.column()
-        col.use_property_split = True
-        col.use_property_decorate = False
-        col.prop(context.scene, "sj_cage_ratio", text="Cage Ratio")
+        if context.object.type == 'MESH':
+            col = layout.column()
+            col.use_property_split = True
+            col.use_property_decorate = False
+            col.prop(context.scene, "sj_cage_ratio", text="Cage Ratio")
 
 
 # ===========================================================================
@@ -2398,6 +2822,10 @@ _CLASSES = (
     SJ_OT_reset,
     SJ_OT_bake,
     SJ_OT_free_bake,
+    SJ_OT_add_bone_jiggle,
+    SJ_OT_remove_bone_jiggle,
+    SJ_OT_select_bone,
+    SJ_OT_bone_stretch,
     SJ_UL_layers,
     VIEW3D_PT_skin_jiggle,
     VIEW3D_PT_skin_jiggle_layer,

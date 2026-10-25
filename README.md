@@ -1,4 +1,4 @@
-# Skin Jiggle Physics 1.10.0 — Blender 4.1+ Addon
+# Skin Jiggle Physics 1.12.0 — Blender 4.1+ Addon
 
 Vertex-group-driven soft tissue simulation built on **Geometry Nodes
 Simulation Zones**. Each jiggle layer is one Geometry Nodes modifier masked
@@ -9,9 +9,11 @@ mesh.
 Because the physics runs inside Geometry Nodes (not Python per-frame), it
 is multithreaded, cached by Blender's simulation system, and bakeable.
 
-Version 1.10 adds **Contact Reach**, so colliders can push skin further than
+Version 1.12 adds **jiggle bones** driven by the same presets and physics.
+Version 1.11 added **material presets** (Jelly, Pudding, Bouncing Ball, Water
+Bed) derived from material measurements. Version 1.10 added **Contact Reach**, so colliders can push skin further than
 the jiggle limit instead of letting it clip, and a reorganized panel. The
-live contact sweep now measures no penetration in any of its 100 profiles;
+live contact sweep measures no penetration in any of its 116 profiles;
 collision values remain adjustable starting points. See [the full preset
 values and calibration guide](PRESET_GUIDE.md) and [the Blender collision
 test results](COLLISION_TESTS.md). Version 1.8 derives
@@ -82,6 +84,46 @@ delete the group, its row in the layer list turns red — click the
 **Skin clipping into a collider?** Raise **Contact Reach** (Limits &
 Gravity). Max Stretch only limits the jiggle itself; Contact Reach is how
 much further a collider may push the skin.
+
+## Jiggle bones (v1.12)
+
+Bones can use the same presets and physics as mesh layers. Select an
+**armature**, select the bones in Pose Mode, and press **Jiggle Selected
+Bones** in the Jiggle tab.
+
+For each bone the add-on sets up:
+
+1. **A hidden helper point** at the bone's tip, parented to the bone's
+   *parent* (e.g. the chest), so it follows the animation without
+   depending on the jiggling bone.
+2. **An ordinary jiggle layer on that point**, so every preset, Contact
+   Reach, collisions, gravity-relative-to-pose and Strength work exactly as
+   on a mesh. A bone tip has no surface, so presets are applied as an
+   isotropic spring: the bone swings at the preset's frequency in every
+   direction (Normal Softness 0, no folds).
+3. **A constraint on the bone** aiming at the simulated point: **Damped
+   Track** (rotate only) or, with **Squash & Stretch** on, **Stretch To**
+   (the bone lengthens and shortens toward the point; good for Jelly and
+   Bouncing Ball).
+
+The armature's Jiggle tab lists its jiggle bones; click one to edit its
+preset, contact style, Strength and settings, or **×** to remove it (the
+constraint and helper point are deleted). **Max Stretch** is how far the
+bone tip may swing. **Bake Simulation** with the armature selected bakes
+all of its jiggle bones.
+
+Notes:
+
+- A jiggle bone's own keyframed rotation is replaced by the jiggle; use
+  the constraint's influence if a bone must also be keyed.
+- A body mesh deformed by an armature with jiggle bones is never a
+  collider (it would form a dependency cycle). Colliders parented to a bone
+  of the same rig, such as a hand proxy, work.
+- With Damped Track the bone keeps its length, so when a collider pushes the
+  tip point further away than the bone reaches, the bone tail can stay
+  slightly inside the collider. Squash & Stretch lets the tail reach the
+  point.
+- Bone chains work: each bone's helper follows its (jiggling) parent.
 
 ## How the physics works
 
@@ -175,6 +217,19 @@ much further a collider may push the skin.
 | Glutes | Soft, Tight, Firm | 2.8 / 5.5 / 7 Hz; 5 / 2.2 / 1.5 cm limits |
 | Thighs | Soft, Firm, Tight | 4 / 7 / 9 Hz; 3 / 1.5 / 1 cm limits |
 | Belly | Soft, Firm | 2 / 4.5 Hz; 6 / 2.5 cm limits |
+
+### Material presets (v1.11)
+
+For whole objects or stylized tissue. Values come from material data —
+see [PRESET_REALISM.md](PRESET_REALISM.md#material-presets) for the
+sources and how each number was derived.
+
+| Preset | Character |
+|---|---|
+| Jelly | 3 Hz, very low damping: about 7 visible wobbles, 4 cm limit |
+| Pudding | 1.2 Hz, heavily damped: slow sag-and-settle, strong bulge, no rebound |
+| Bouncing Ball (Stylized) | 3.5 Hz squash-and-stretch, restitution 0.85 (rebounds to 72 % of the drop) |
+| Water Bed | 0.4 Hz slosh, waves fade over about 7–8 s, wide 8-ring contact bulge |
 
 The Add Layer dialog's **vertex group field is a search bar** — start
 typing and it autocompletes from the object's groups (pre-filled with
@@ -302,6 +357,9 @@ those two effects need vertex density to read.
 
 Use **Bake Simulation** in the panel (wraps Blender's simulation-zone
 bake) once you're happy, so scrubbing and rendering are deterministic.
+Save the .blend first. On Blender 4.x each layer bakes into its own folder,
+`sj_bake/<object>_<layer>/` next to the .blend (Blender 5 packs bakes into
+the file). With an armature selected, all of its jiggle bones are baked.
 **Delete Bake** frees it. **Reset Simulation** just jumps to the scene
 start frame, which clears the live cache.
 
@@ -349,6 +407,19 @@ start frame, which clears the live cache.
 - The generated node group `SkinJiggleCore` is shared by all layers; the
   node layout is auto-generated (a grid) but fully inspectable/editable
   if you want to extend it.
+
+## Upgrading to 1.12.0
+
+- Install `dist/skin_jiggle_physics_1.12.0.zip`. Select an armature to use
+  the new **jiggle bones**.
+- **Baking now works on Blender 4.x.** Earlier versions created layers
+  with no bake folder, so Blender 4.1 reported a successful bake but stored
+  nothing. Re-bake layers that you believed were baked.
+
+## Upgrading to 1.11.0
+
+- Install `dist/skin_jiggle_physics_1.11.0.zip`. New layers can use the
+  **Materials** presets; press **Upgrade Layers** on existing objects.
 
 ## Upgrading to 1.10.0
 

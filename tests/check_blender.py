@@ -109,7 +109,7 @@ for key, (_, preset_values) in sj.PRESETS.items():
         assert mod['sj_contact_style'] == style
         actual_gap = mod[sj._input_ident_map(ng)['Collision Distance']]
         assert 0 <= actual_gap <= .01
-print('SJ_CHECK: all 100 body/contact profile combinations load', flush=True)
+print(f'SJ_CHECK: all {len(sj.PRESETS) * 4} body/contact profile combinations load', flush=True)
 sj._apply_preset(mod, ng, 'SOFT_SKIN')
 
 scene.cursor.location = (5, 5, 5)

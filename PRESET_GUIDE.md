@@ -1,4 +1,4 @@
-# Skin Jiggle Physics 1.10.0 — preset calibration
+# Skin Jiggle Physics 1.12.0 — preset calibration
 
 These are plausible animation starting points for an adult human at actual
 scale, with **one Blender world unit equal to one metre** (Scene Unit Scale 1).
@@ -69,6 +69,10 @@ thickness, friction 56/80, and damping 0.95.
 | Thighs — Tight | 9.0 | 0.50 | 677.17 | 56.55 | 0.18 | 0.15 | 1.0 | 10 | 0.8 | 0.38 | 0.01 | 0.16 | 2 |
 | Belly — Soft | 2.0 | 0.45 | 315.83 | 11.31 | 0.80 | 0.60 | 6.0 | 6 | 3.0 | 0.70 | 0.04 | 0.70 | 4 |
 | Belly — Firm | 4.5 | 0.55 | 491.96 | 31.10 | 0.40 | 0.35 | 2.5 | 6 | 1.5 | 0.50 | 0.02 | 0.32 | 3 |
+| Jelly | 3.0 | 0.05 | 118.44 | 1.88 | 0.30 | 0.10 | 4.0 | 6 | 2.0 | 0.30 | 0.30 | 0.60 | 4 |
+| Pudding | 1.2 | 0.15 | 24.36 | 2.26 | 0.30 | 0.30 | 5.0 | 6 | 2.0 | 0.60 | 0.02 | 1.00 | 5 |
+| Bouncing Ball (Stylized) | 3.5 | 0.05 | 362.71 | 2.29 | 0.30 | 0.60 | 5.0 | 6 | 1.5 | 0.50 | 0.85 | 0.80 | 4 |
+| Water Bed | 0.4 | 0.12 | 9.47 | 0.60 | 0.30 | 0.80 | 8.0 | 6 | 3.0 | 0.30 | 0.05 | 1.00 | 8 |
 <!-- PRESET_TABLE_END -->
 
 Choose **Body preset** to restore that tissue preset's collision values. **Soft
@@ -86,9 +90,15 @@ and damping and reduces travel; a sports bra does so further. Firm/tight muscle
 profiles settle faster and travel less than loose adipose-dominated profiles.
 These choices describe relative behavior, not universal measurements.
 
+The **Materials** presets (Jelly, Pudding, Bouncing Ball, Water Bed) are the
+exception: their frequency and damping come from material data — gelatin and
+starch-gel rheology, ball restitution and waterbed sloshing — as documented in
+[PRESET_REALISM.md](PRESET_REALISM.md#material-presets). Bouncing Ball's
+frequency is deliberately slowed (real ball squash rings near 100 Hz).
+
 ## Research basis and limits
 
-The 100-profile animated contact sweep is recorded in
+The 116-profile animated contact sweep is recorded in
 [COLLISION_TESTS.md](COLLISION_TESTS.md). In 1.9.0 it measured up to
 **11 mm of penetration**, because the display capped collision pushes at
 Max Stretch. Since 1.10.0 a collider may push skin up to Max Stretch +
@@ -108,6 +118,9 @@ optimum for moving contact; review the result in the target scene.
 - [Wakeling & Nigg, Soft-tissue vibrations in the quadriceps measured with skin mounted transducers (2001)](https://pubmed.ncbi.nlm.nih.gov/11266679/)
   models impact responses as damped oscillations, motivating frequency and
   damping ratio as calibration controls.
+
+For a preset-by-preset comparison with the measured values that do exist,
+see [PRESET_REALISM.md](PRESET_REALISM.md).
 
 **The exact preset numbers are engineering choices, not values extracted from
 these papers.** There is no subject-specific experimental calibration for the
@@ -151,7 +164,7 @@ Reach rather than Max Stretch, so the jiggle keeps its limit. Partial Blend
 
 ## Upgrade
 
-Install version 1.10.0 and select **Upgrade Layers** on existing objects. This
+Install version 1.12.0 and select **Upgrade Layers** on existing objects. This
 rebuilds their engine and associated cages while preserving settings. It does
 not silently replace shot-specific tuning with the new presets. Reapply a
 preset explicitly to use this table, then delete old bakes and bake again.
