@@ -1,4 +1,4 @@
-# Skin Jiggle Physics 1.9.0 — preset calibration
+# Skin Jiggle Physics 1.10.0 — preset calibration
 
 These are plausible animation starting points for an adult human at actual
 scale, with **one Blender world unit equal to one metre** (Scene Unit Scale 1).
@@ -89,12 +89,12 @@ These choices describe relative behavior, not universal measurements.
 ## Research basis and limits
 
 The 100-profile animated contact sweep is recorded in
-[COLLISION_TESTS.md](COLLISION_TESTS.md). It found up to **11 mm of
-penetration** in the tested press/release, despite the static contact-gap
-regression passing. The listed collision values are therefore adjustable
-starting points, not a validated optimum for moving contact. Raise collider
-Thickness Outer to catch a faster press earlier, accepting a larger resting
-gap, and review the result in the target scene.
+[COLLISION_TESTS.md](COLLISION_TESTS.md). In 1.9.0 it measured up to
+**11 mm of penetration**, because the display capped collision pushes at
+Max Stretch. Since 1.10.0 a collider may push skin up to Max Stretch +
+Contact Reach and the sweep measures **no penetration** in any profile.
+The collision values are still adjustable starting points, not a validated
+optimum for moving contact; review the result in the target scene.
 
 - [Haake & Scurr, A dynamic model of the breast during exercise (2010)](https://researchportal.port.ac.uk/en/publications/a-dynamic-model-of-the-breast-during-exercise/)
   supports increasing stiffness and damping with everyday and sports-bra
@@ -124,10 +124,11 @@ substeps improve integration, not collision sampling. Animated colliders change
 position, but their material-point velocity is not included in friction or
 impact response. Apply sheared parent transforms before judging accuracy.
 
-Zero-weight vertices remain fixed. Max Stretch also caps the displayed result
-after smoothing and squash. If contact clearance requires more travel than that
-limit, clipping is unavoidable; correct the pose/contact setup or increase the
-limit. Display smoothing and partial Blend can also soften contact clearance.
+Zero-weight vertices remain fixed. Max Stretch caps the jiggle (springs,
+smoothing and squash); collisions may push up to Contact Reach further. If
+contact clearance needs more than Max Stretch + Contact Reach, raise Contact
+Reach rather than Max Stretch, so the jiggle keeps its limit. Partial Blend
+(Strength) also scales the contact push down.
 
 ## Calibrating a character
 
@@ -150,7 +151,7 @@ limit. Display smoothing and partial Blend can also soften contact clearance.
 
 ## Upgrade
 
-Install version 1.9.0 and select **Upgrade Layers** on existing objects. This
+Install version 1.10.0 and select **Upgrade Layers** on existing objects. This
 rebuilds their engine and associated cages while preserving settings. It does
 not silently replace shot-specific tuning with the new presets. Reapply a
 preset explicitly to use this table, then delete old bakes and bake again.

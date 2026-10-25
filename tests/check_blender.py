@@ -84,9 +84,22 @@ for frame in range(1, 8):
     coords = positions(ob)
 assert abs(coords[0].z) < 1e-6, ('unpainted vertex moved', coords[0])
 assert coords[1].z > .01, ('simulation did not advance', coords)
+# The floor needs 50 mm of travel, Max Stretch allows 25 mm of jiggle:
+# Contact Reach (default 100 mm) lets the collision win instead of clipping.
+reach = mod[sj._input_ident_map(ng)['Contact Reach']]
+assert all(v.z >= .05 - 1e-4 for v in coords[1:]), ('skin clipped through floor', coords)
+assert all((v - ob.matrix_world @ ob.data.vertices[i].co).length <= .025 + reach + 1e-5
+           for i, v in enumerate(coords)), ('contact reach exceeded', coords)
+# With no Contact Reach, Max Stretch is still the hard limit.
+values(mod, Contact_Reach=0.0)
+scene.frame_set(1)
+for frame in range(2, 8):
+    scene.frame_set(frame)
+    coords = positions(ob)
 assert all((v - ob.matrix_world @ ob.data.vertices[i].co).length <= .02501
            for i, v in enumerate(coords)), ('stretch exceeded', coords)
-print('SJ_CHECK: playback, pinned mask and final stretch limit pass', flush=True)
+values(mod, Contact_Reach=reach)
+print('SJ_CHECK: playback, pinned mask, contact reach and stretch limit pass', flush=True)
 
 for key, (_, preset_values) in sj.PRESETS.items():
     sj._apply_preset(mod, ng, key)

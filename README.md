@@ -1,4 +1,4 @@
-# Skin Jiggle Physics 1.9.0 — Blender 4.1+ Addon
+# Skin Jiggle Physics 1.10.0 — Blender 4.1+ Addon
 
 Vertex-group-driven soft tissue simulation built on **Geometry Nodes
 Simulation Zones**. Each jiggle layer is one Geometry Nodes modifier masked
@@ -9,9 +9,10 @@ mesh.
 Because the physics runs inside Geometry Nodes (not Python per-frame), it
 is multithreaded, cached by Blender's simulation system, and bakeable.
 
-Version 1.9 includes per-body collision defaults and a reproducible live
-contact sweep. The sweep found that moving presses can still penetrate, so
-the collision values are adjustable starting points. See [the full preset
+Version 1.10 adds **Contact Reach**, so colliders can push skin further than
+the jiggle limit instead of letting it clip, and a reorganized panel. The
+live contact sweep now measures no penetration in any of its 100 profiles;
+collision values remain adjustable starting points. See [the full preset
 values and calibration guide](PRESET_GUIDE.md) and [the Blender collision
 test results](COLLISION_TESTS.md). Version 1.8 derives
 spring values from oscillation frequency and damping ratio. These
@@ -40,8 +41,8 @@ Blender, so the previous module isn't still loaded.
 2. In Weight Paint mode, paint a vertex group over the tissue you want to
    jiggle. Weight 1 = fully dynamic, 0 = pinned, gradients = smooth
    falloff at the borders (paint soft edges — it matters a lot).
-3. `N` panel → Jiggle tab → **Add Jiggle Layer** → pick the vertex group
-   and a preset.
+3. `N` panel → Jiggle tab → **Add Jiggle Layer** (or **+** beside the
+   layer list) → pick the vertex group and a preset.
 4. **Play the timeline.** Simulation zones simulate during playback; they
    reset automatically when you jump back to the scene start frame.
 5. Repeat for as many vertex groups as you want — each gets its own layer.
@@ -55,8 +56,32 @@ viewport/render subdivision levels above it), the layer restarts from
 rest instead of showing scrambled vertices.
 
 **Vertex groups:** a layer finds its group by name. If you rename or
-delete the group, the layer row turns red ("Missing group") — press
-**Pick** to point it at the right group.
+delete the group, its row in the layer list turns red — click the
+**Group** button in Layer Settings to pick the right group.
+
+## The Jiggle panel
+
+- **Skin Jiggle** — the Animation Mode toggle and the **layer list**: one
+  row per vertex group, with **+** / **−** to add or remove layers and an
+  eye to switch a layer off. Click a row to edit it below.
+- **Layer Settings** — for the selected layer:
+  - **Group**, **Preset** and **Contact** buttons show the current choice;
+    click to change it.
+  - **Strength** fades the whole layer (animatable).
+  - A one-line read-out of how the layer feels, e.g. *Bouncy, 2.6 Hz* and
+    how far the jiggle may travel.
+  - **Fast Preview Cage** for heavy meshes.
+  - Collapsible sections: **Motion**, **Limits & Gravity** (open by
+    default — Contact Reach lives here), **Collision**, **Folds & Squash**
+    and **Quality**.
+- **Colliders** (collapsed) — add a hand collider and tune every
+  collider's thickness, friction and damping.
+- **Simulation & Bake** (collapsed) — reset, bake, delete bake, reset all
+  settings and the cage ratio.
+
+**Skin clipping into a collider?** Raise **Contact Reach** (Limits &
+Gravity). Max Stretch only limits the jiggle itself; Contact Reach is how
+much further a collider may push the skin.
 
 ## How the physics works
 
@@ -95,8 +120,12 @@ delete the group, the layer row turns red ("Missing group") — press
 - **Fold Smoothing** blurs the dynamic offset across neighbouring
   vertices, so skin moves cohesively and folds in patches instead of
   vibrating per-vertex. Normalized masked smoothing keeps unpainted
-  vertices pinned, and the final offset is capped by Max Stretch even
-  after squash and smoothing.
+  vertices pinned. Vertices resting on a collider keep their exact
+  contact position instead of being smoothed back into it.
+- **Max Stretch limits the jiggle; Contact Reach limits collisions.** The
+  jiggle (springs, smoothing, squash) never moves skin further than Max
+  Stretch. A collider may push it further, by up to Contact Reach more,
+  so skin rests on the collider instead of clipping through it.
 - Stability guards: physics substeps, exponential damping, relative
   speed clamping, a stiffness clamp tied to the timestep, and a hard
   **Max Stretch** distance limit. It should be very hard to make it
@@ -114,7 +143,8 @@ delete the group, the layer row turns red ("Missing group") — press
 | Damping | Velocity decay rate in 1/s (physical damping coefficient divided by effective mass) | low = longer oscillation, high = faster settling |
 | Mass | Effective spring-model mass, not anatomical mass per vertex | timing depends on Stiffness / Mass |
 | Gravity | Sag when the body turns away from its modeled pose (× 9.81) | hang/droop when lying down or bending over; none in the modeled pose; capped at half of Max Stretch |
-| Max Stretch | Hard distance limit from the surface (m) | keeps things anatomical, prevents rubbery over-shoot |
+| Max Stretch | Hard limit on how far the jiggle moves skin from the surface (m) | keeps things anatomical, prevents rubbery over-shoot |
+| Contact Reach | How much further than Max Stretch a collider may push skin (m, default 0.1) | raise if skin clips into a collider; 0 = old behavior, collisions capped at Max Stretch |
 | Bounce | Floor and object restitution | realistic presets use low values; collider damping reduces it further |
 | Fold Smoothing / Iterations | Cohesion blur of the offset | broader = big soft folds, off = per-vertex shimmer |
 | Substeps | Physics steps per frame | raise for stiff, light tissue (high Stiffness ÷ Mass); doesn't affect collision detection, which runs once per frame |
@@ -212,9 +242,10 @@ Use local colliders or library overrides so the settings modifier can be added.
 Collision distances and normals are evaluated in world space, including
 on nonuniformly scaled objects. Moving collider velocity is not included
 in the impact/friction calculation; fast moving props remain an approximation.
-Max Stretch and painted pins take priority over contact clearance. If the
-pose penetrates farther than the permitted displacement, or display smoothing
-pulls tissue across a contact, clipping may remain.
+Painted pins (weight 0) take priority over contact clearance. A collider
+may push skin up to Max Stretch + **Contact Reach** from its animated
+position; if the pose penetrates deeper than that, raise Contact Reach.
+Strength (Blend) below 1 also scales the contact push down.
 
 ## Performance & Animation Mode (v1.5)
 
@@ -246,9 +277,9 @@ New layers inherit the current mode automatically.
 
 ## Cage Preview (heavy meshes) — per layer
 
-Every jiggle layer has its own **cage button** (the icosphere icon in
-the layer row). Pressing it builds a light proxy of JUST that layer's
-painted region:
+Every jiggle layer has its own **Fast Preview Cage** button (in Layer
+Settings). Pressing it builds a light proxy of JUST that layer's painted
+region:
 
 - The cage contains only the vertices painted in the layer's vertex
   group, **decimated once and baked statically** at the panel's Cage
@@ -319,6 +350,16 @@ start frame, which clears the live cache.
   node layout is auto-generated (a grid) but fully inspectable/editable
   if you want to extend it.
 
+## Upgrading to 1.10.0
+
+- Install `dist/skin_jiggle_physics_1.10.0.zip` and press **Upgrade
+  Layers** on existing objects to get Contact Reach (default 0.1 m).
+- Collisions are no longer cut off at Max Stretch, so skin that used to
+  clip now rests on the collider. Set Contact Reach to 0 for the old
+  behavior.
+- New panel layout: layer list, Layer Settings with collapsible sections,
+  Colliders and Simulation & Bake sub-panels.
+
 ## Upgrading to 1.9.0
 
 - Install the new Python file or `dist/skin_jiggle_physics_1.9.0.zip`.
@@ -339,6 +380,6 @@ start frame, which clears the live cache.
   Damping where the preset used a whole number). Layers will now feel
   different — check them by eye, especially anything tuned before.
 - Existing layers keep their old engine until you press **Upgrade
-  Layers** (the red box in the Jiggle panel). It keeps all settings,
+  Layers** (the red box at the top of the Jiggle panel). It keeps all settings,
   restarts the simulation, and invalidates existing bakes of those
   layers — re-bake afterwards.

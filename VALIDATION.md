@@ -1,4 +1,4 @@
-# Validation — version 1.9.0
+# Validation — version 1.10.0
 
 Validated with the installed Blender **4.1.1** and **5.1.2** executables using
 factory-startup background sessions. No existing user scenes were opened or
@@ -12,14 +12,16 @@ blender --background --factory-startup --python-exit-code 1 --python tests/check
 
 The regression script checks:
 
-- The generated 410-node graph builds and is reusable.
+- The generated 448-node graph builds and is reusable.
 - All 25 presets match their declared frequency and damping ratio, stay
   within every exposed parameter range, and avoid the stiffness stability
   clamp at 24 fps with their normal-quality substep settings.
 - Actual evaluated simulation advances across frames.
 - Zero-weight vertices remain pinned with smoothing and collision enabled.
-- The displayed displacement respects Max Stretch even with squash enabled
-  and a floor contact that demands more travel than the permitted limit.
+- A floor contact needing 50 mm of travel against a 25 mm Max Stretch is
+  resolved (skin rests on the floor, within Max Stretch + Contact Reach);
+  with Contact Reach 0 the displacement still respects Max Stretch, squash
+  included.
 - Two collider objects sharing one mesh retain different evaluated thickness
   attributes while the shared source mesh remains unchanged.
 - Collider helper collections are isolated between scenes.
@@ -41,11 +43,14 @@ collision work; structural collider changes are deferred to the repair timer.
 The complete suite passes after that change.
 
 The live 100-profile collision sweep is documented in
-[COLLISION_TESTS.md](COLLISION_TESTS.md). It measures up to 11 mm of
-penetration during an animated press/release even though the static collision
-gap check passes. The current once-per-frame contact query needs further work
-for moving collisions; these results are recorded as a known limitation, not
-as a successful dynamic collision calibration.
+[COLLISION_TESTS.md](COLLISION_TESTS.md). Since 1.10.0 it measures no
+penetration in any profile (1.9.0: up to 11 mm). Contacts are still sampled
+once per frame, so very fast presses against thin colliders remain an
+approximation.
+
+The 1.10.0 panel was checked by opening Blender 4.1.1 and 5.1.2 with a test
+scene and screenshotting the Jiggle sidebar (layer list, Layer Settings,
+empty state); no drawing errors were reported.
 
 Interactive playback speed, rendering/bake round trips, clothing interaction,
 complex rigs with shape keys, sheared parents, library overrides and

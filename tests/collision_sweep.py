@@ -109,7 +109,7 @@ for key, style, ob, mod in cases:
         'min_frame': metrics[id(ob)]['min_frame'],
     })
 
-output = ROOT / 'dist' / 'collision_sweep_1.9.0.csv'
+output = ROOT / 'dist' / f'collision_sweep_{sj.BUILD_TAG}.csv'
 output.parent.mkdir(exist_ok=True)
 with output.open('w', newline='', encoding='utf-8') as stream:
     writer = csv.DictWriter(stream, fieldnames=list(rows[0]))

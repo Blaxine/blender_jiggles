@@ -37,7 +37,7 @@
 bl_info = {
     "name": "Skin Jiggle Physics",
     "author": "Claude (Anthropic)",
-    "version": (1, 9, 0),
+    "version": (1, 10, 0),
     "blender": (4, 1, 0),
     "location": "3D Viewport > Sidebar (N) > Jiggle",
     "description": "High-end vertex-group soft tissue / skin jiggle physics "
@@ -54,7 +54,7 @@ from bpy.app.handlers import persistent
 
 CORE_NAME = "SkinJiggleCore"
 SJ_COLL = "SJ_Colliders"
-BUILD_TAG = "1.9.0"
+BUILD_TAG = "1.10.0"
 _LOG = logging.getLogger(__name__)
 SAG_FRACTION = 0.5   # gravity sag may use at most this share of Max Stretch
 
@@ -85,8 +85,9 @@ _SOCKET_DEFS = [
      "The modeled shape already includes gravity, so an upright pose "
      "doesn't sag further. Capped at half of Max Stretch"),
     ("Max Stretch", 'NodeSocketFloat', 0.025, 0.001, 10.0, 'DISTANCE',
-     "Hard limit (metres, world space) on how far a vertex may leave "
-     "the animated surface. Prevents explosions and rubbery over-stretch"),
+     "Hard limit (metres, world space) on how far the JIGGLE may move a "
+     "vertex from the animated surface. Collisions may push further, up "
+     "to Contact Reach more"),
     ("Bounce", 'NodeSocketFloat', 0.05, 0.0, 1.0, 'FACTOR',
      "Restitution for floor and object impacts. Collider damping reduces "
      "this further; soft tissue normally has low restitution"),
@@ -127,17 +128,26 @@ _SOCKET_DEFS = [
     ("Reference Object", 'NodeSocketObject', None, None, None, 'NONE',
      "Managed by the addon: hidden empty mirroring this object's world "
      "transform, so the sim updates in real time when the object moves"),
+    # appended last so existing socket identifiers keep their numbers
+    ("Contact Reach", 'NodeSocketFloat', 0.10, 0.0, 1.0, 'DISTANCE',
+     "How much FURTHER than Max Stretch a collider may push the skin. "
+     "Raise it if skin still clips into a collider; Max Stretch then "
+     "keeps limiting only the jiggle"),
 ]
 
-_PANEL_ORDER = [
-    ("Spring", ["Stiffness", "Normal Softness", "Damping", "Mass"]),
-    ("Forces", ["Gravity", "Max Stretch"]),
-    ("Skin / Folds", ["Fold Smoothing", "Fold Iterations",
-                      "Squash Amount", "Squash Spread"]),
-    ("Collision", ["Floor Collision", "Floor Height", "Bounce",
-                   "Object Collision", "Collision Distance",
-                   "Collision Friction"]),
-    ("Quality", ["Substeps", "Blend"]),
+# Collapsible sections of the active layer: (id, label, icon, inputs)
+_LAYER_SECTIONS = [
+    ("motion", "Motion", 'FORCE_HARMONIC',
+     ["Stiffness", "Damping", "Mass", "Normal Softness"]),
+    ("limits", "Limits & Gravity", 'FULLSCREEN_EXIT',
+     ["Max Stretch", "Contact Reach", "Gravity"]),
+    ("collision", "Collision", 'MOD_PHYSICS',
+     ["Object Collision", "Collision Distance", "Collision Friction",
+      "Bounce", "Floor Collision", "Floor Height"]),
+    ("folds", "Folds & Squash", 'MOD_SMOOTH',
+     ["Fold Smoothing", "Fold Iterations", "Squash Amount",
+      "Squash Spread"]),
+    ("quality", "Quality", 'PREFERENCES', ["Substeps"]),
 ]
 
 # ---------------------------------------------------------------------------
@@ -947,6 +957,10 @@ def _build_core_group():
                        MT('MULTIPLY', cfb.outputs['Y'], -1.0))))
     vel = SWITCHV(resp, vel, vel_col)
 
+    # --- collisions may push beyond the jiggle limit, by up to Contact Reach
+    reach = MT('ADD', GP("Max Stretch"), GP("Contact Reach"))
+    pos = VM('ADD', tgt_sub, CAPV(VM('SUBTRACT', pos, tgt_sub), reach))
+
     # --- final state after collision resolution
     pos_final = pos
     vel_final = vel
@@ -991,6 +1005,22 @@ def _build_core_group():
     w = CLAMP01(weight)
     shown = MIXV(w, tgt_world, NATTR("sj_pos"))
     shown = SWITCHV(CMP_LT(0.0, w), tgt_world, COLLIDE_POS(shown))
+    shown = VM('ADD', tgt_world,
+               CAPV(VM('SUBTRACT', shown, tgt_world), reach))
+
+    # Contact bookkeeping for the display path: how far beyond Max Stretch
+    # a collider pushed this vertex (the display cap grows by that much),
+    # and whether it rests on a contact (display smoothing must not pull
+    # it back into the collider).
+    excess = MT('MAXIMUM',
+                MT('SUBTRACT', VM('LENGTH', VM('SUBTRACT', shown, tgt_world)),
+                   GP("Max Stretch")), 0.0)
+    on_plane = BAND(chit, CMP_LT(VM('DOT_PRODUCT', VM('SUBTRACT', shown, cp),
+                                    cn), 0.001))
+    on_floor = BAND(GP("Floor Collision"),
+                    CMP_LT(SEP(shown).outputs['Z'],
+                           MT('ADD', GP("Floor Height"), 0.001)))
+    touching = BAND(CMP_LT(0.0, w), BOR(on_plane, on_floor))
 
     # Jiggle offset in LOCAL space, captured at simulation time. The
     # display path applies this on top of the live animated pose, so the
@@ -1001,6 +1031,8 @@ def _build_core_group():
     off_l = ROT(off_w, INVROT(oi_zone.outputs['Rotation']))
     off_l = VM('DIVIDE', off_l, oi_zone.outputs['Scale'])
     fg = STORE(ZS(rep_out.outputs), "sj_off", off_l)
+    fg = STORE(fg, "sj_cx", excess, dtype='FLOAT')
+    fg = STORE(fg, "sj_touch", touching, dtype='BOOLEAN')
     fg = STORE(fg, "sj_tgt", tgt_world)
     fg = STORE(fg, "sj_hastgt", True, dtype='BOOLEAN')
     fg = STORE(fg, "sj_sec", scene_sec, dtype='FLOAT')
@@ -1038,6 +1070,11 @@ def _build_core_group():
     smooth_offset = VM('SCALE', blur.outputs['Value'],
                        MT('DIVIDE', post_weight,
                           MT('MAXIMUM', weight_blur.outputs['Value'], 1e-6)))
+    # vertices resting on a contact keep their exact collision-resolved
+    # offset: averaging with free neighbours would pull them into the collider
+    touch_now = SAMPLE(ZS(sim_out.outputs), NATTR("sj_touch", 'BOOLEAN'),
+                       idx2, dtype='BOOLEAN')
+    smooth_offset = SWITCHV(touch_now, smooth_offset, offset)
 
     # --- squash response: compressed tissue bulges the surrounding skin.
     # Blur the per-vertex compression across neighbours; where the
@@ -1070,10 +1107,15 @@ def _build_core_group():
                        VM('ADD', smooth_offset, bulge_vec),
                        gi_post.outputs['Blend'])
     # Smoothing and squash are display effects; they must respect the same
-    # world-distance limit as the solver, including on scaled objects.
+    # world-distance limit as the solver, including on scaled objects. The
+    # limit grows by however far a collider pushed the vertex past Max
+    # Stretch — capping that away is what made skin clip into colliders.
     offset_world = ROT(VM('MULTIPLY', offset_scaled, oi_post.outputs['Scale']),
                        oi_post.outputs['Rotation'])
-    offset_world = CAPV(offset_world, gi_post.outputs['Max Stretch'])
+    cx_now = SAMPLE(ZS(sim_out.outputs), NATTR("sj_cx", 'FLOAT'), idx2,
+                    dtype='FLOAT')
+    offset_world = CAPV(offset_world,
+                        MT('ADD', gi_post.outputs['Max Stretch'], cx_now))
     offset_scaled = VM('DIVIDE',
                        ROT(offset_world, INVROT(oi_post.outputs['Rotation'])),
                        oi_post.outputs['Scale'])
@@ -1480,6 +1522,7 @@ class SJ_OT_add_layer(Operator):
                    bool(context.scene.sj_anim_mode))
         mod.show_expanded = False
         placed = _place_before_subdivision(context, obj, mod)
+        obj.sj_active_layer = list(obj.modifiers).index(mod)
         _refresh(obj)
         self.report({'INFO'},
                     f"Jiggle layer added for '{self.vertex_group}' "
@@ -1545,6 +1588,10 @@ class SJ_OT_set_group(Operator):
         search=_vg_search)
 
     def invoke(self, context, event):
+        mod = context.object.modifiers.get(self.modifier_name)
+        group = _layer_group(mod) if mod and mod.node_group else ""
+        if group in context.object.vertex_groups:
+            self.vertex_group = group     # open on the current one
         return context.window_manager.invoke_props_dialog(self)
 
     def execute(self, context):
@@ -1573,6 +1620,9 @@ class SJ_OT_apply_preset(Operator):
                          default='SOFT_SKIN')
 
     def invoke(self, context, event):
+        mod = context.object.modifiers.get(self.modifier_name)
+        if mod is not None and mod.get('sj_body_preset') in PRESETS:
+            self.preset = mod['sj_body_preset']   # open on the current one
         return context.window_manager.invoke_props_dialog(self)
 
     def execute(self, context):
@@ -2058,16 +2108,87 @@ class SJ_OT_free_bake(Operator):
 # ===========================================================================
 #  UI
 # ===========================================================================
-class VIEW3D_PT_skin_jiggle(Panel):
-    bl_label = "Skin Jiggle Physics"
+def _layer_group(mod):
+    """Name of the vertex group driving a layer ('' if none)."""
+    ident = _input_ident_map(mod.node_group).get("Weight")
+    return mod.get(f"{ident}_attribute_name", "") if ident else ""
+
+
+def _active_layer(obj):
+    """The layer selected in the list, falling back to the first one."""
+    mods = _jiggle_modifiers(obj)
+    idx = obj.sj_active_layer
+    if 0 <= idx < len(obj.modifiers) and obj.modifiers[idx] in mods:
+        return obj.modifiers[idx]
+    return mods[0] if mods else None
+
+
+def _feel_summary(mod):
+    """Plain-language read-out of a layer's spring: feel, Hz and travel."""
+    v = {name: mod.get(ident)
+         for name, ident in _input_ident_map(mod.node_group).items()}
+    try:
+        k_n = v["Stiffness"] * max(1.0 - v["Normal Softness"], 0.02)
+        omega = math.sqrt(k_n / max(v["Mass"], 1e-4))
+        zeta = v["Damping"] / (2.0 * omega) if omega > 0 else 1.0
+        travel = v["Max Stretch"] * 100.0
+    except (TypeError, KeyError, ValueError):
+        return None
+    feel = ("Very bouncy" if zeta < 0.25 else "Bouncy" if zeta < 0.45
+            else "Soft" if zeta < 0.7 else "Firm, settles fast")
+    return (f"{feel}, {omega / (2 * math.pi):.1f} Hz",
+            f"Jiggle travel up to {travel:.1f} cm")
+
+
+def _preset_label(mod):
+    return PRESETS.get(mod.get('sj_body_preset', ''), ("Custom",))[0]
+
+
+class SJ_UL_layers(bpy.types.UIList):
+    """Jiggle layers of the object: its jiggle modifiers only."""
+
+    def filter_items(self, context, data, propname):
+        flags = [self.bitflag_filter_item
+                 if (m.type == 'NODES' and m.node_group
+                     and m.node_group.name.startswith(CORE_NAME)) else 0
+                 for m in getattr(data, propname)]
+        return flags, []
+
+    def draw_item(self, context, layout, data, item, icon, active_data,
+                  active_propname, index):
+        group = _layer_group(item)
+        missing = group not in data.vertex_groups
+        row = layout.row(align=True)
+        name = row.row(align=True)
+        name.alert = missing
+        name.label(text=group or "<no group>",
+                   icon='ERROR' if missing else 'GROUP_VERTEX')
+        cage = _layer_cage(item)
+        if cage is not None and not cage.hide_viewport:
+            row.label(text="", icon='MESH_ICOSPHERE')
+        row.prop(item, "show_viewport", text="", emboss=False)
+
+
+class _SJPanel:
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "Jiggle"
 
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.object.type == 'MESH'
+
+
+class VIEW3D_PT_skin_jiggle(_SJPanel, Panel):
+    bl_label = "Skin Jiggle"
+
+    @classmethod
+    def poll(cls, context):
+        return True
+
     def draw(self, context):
         layout = self.layout
         obj = context.object
-
         if not obj or obj.type != 'MESH':
             layout.label(text="Select a mesh object", icon='INFO')
             return
@@ -2081,6 +2202,12 @@ class VIEW3D_PT_skin_jiggle(Panel):
             warning = layout.box()
             warning.alert = True
             warning.label(text='Zero object scale: restore a nonzero scale', icon='ERROR')
+        n_old = len(_old_layers(obj))
+        if n_old:
+            box = layout.box()
+            box.alert = True
+            box.label(text=f"{n_old} layer(s) use an older engine", icon='ERROR')
+            box.operator("skin_jiggle.upgrade_layers", icon='FILE_REFRESH')
 
         row = layout.row(align=True)
         row.scale_y = 1.3
@@ -2088,117 +2215,169 @@ class VIEW3D_PT_skin_jiggle(Panel):
                  icon='PLAY' if not context.scene.sj_anim_mode
                  else 'RENDER_ANIMATION', toggle=True)
 
-        col = layout.column(align=True)
-        col.operator("skin_jiggle.add_layer", icon='ADD')
+        if not _jiggle_modifiers(obj):
+            box = layout.box()
+            col = box.column(align=True)
+            col.label(text="No jiggle layers yet", icon='INFO')
+            col.label(text="1. Paint a vertex group (Weight Paint)")
+            col.label(text="2. Add a layer for it")
+            row = layout.row()
+            row.scale_y = 1.3
+            row.operator("skin_jiggle.add_layer", icon='ADD')
+            return
 
-        row = col.row(align=True)
-        row.operator("skin_jiggle.reset", icon='FILE_REFRESH')
-        row = col.row(align=True)
-        row.operator("skin_jiggle.reset_defaults", icon='LOOP_BACK')
+        row = layout.row()
+        row.template_list("SJ_UL_layers", "", obj, "modifiers",
+                          obj, "sj_active_layer", rows=3)
+        side = row.column(align=True)
+        side.operator("skin_jiggle.add_layer", text="", icon='ADD')
+        active = _active_layer(obj)
+        if active is not None:
+            op = side.operator("skin_jiggle.remove_layer", text="",
+                               icon='REMOVE')
+            op.modifier_name = active.name
+
+
+class VIEW3D_PT_skin_jiggle_layer(_SJPanel, Panel):
+    bl_label = "Layer Settings"
+    bl_parent_id = "VIEW3D_PT_skin_jiggle"
+
+    @classmethod
+    def poll(cls, context):
+        return (super().poll(context)
+                and _active_layer(context.object) is not None)
+
+    def draw(self, context):
+        layout = self.layout
+        obj = context.object
+        mod = _active_layer(obj)
+        ident_map = _input_ident_map(mod.node_group)
+
+        def labelled(text):
+            split = layout.split(factor=0.28, align=True)
+            split.label(text=text)
+            return split
+
+        group = _layer_group(mod)
+        missing = group not in obj.vertex_groups
+        row = labelled("Group")
+        row.alert = missing
+        op = row.operator("skin_jiggle.set_group",
+                          text=f"Missing '{group or '-'}': pick"
+                          if missing else group,
+                          icon='ERROR' if missing else 'GROUP_VERTEX')
+        op.modifier_name = mod.name
+        row = labelled("Preset")
+        op = row.operator("skin_jiggle.apply_preset",
+                          text=_preset_label(mod), icon='PRESET')
+        op.modifier_name = mod.name
+        row = labelled("Contact")
+        style = mod.get('sj_contact_style', 'BODY')
+        op = row.operator('skin_jiggle.contact_style',
+                          text=next((label for ident, label, _ in _CONTACT_STYLES
+                                     if ident == style), 'Body preset'),
+                          icon='PHYSICS')
+        op.modifier_name = mod.name
+
+        ident = ident_map.get("Blend")
+        if ident:
+            layout.prop(mod, f'["{ident}"]', text="Strength", slider=True)
+
+        summary = _feel_summary(mod)
+        if summary:
+            col = layout.column(align=True)
+            col.scale_y = 0.85
+            col.label(text=summary[0], icon='FORCE_HARMONIC')
+            col.label(text=summary[1], icon='BLANK1')
+
+        row = layout.row(align=True)
+        cage = _layer_cage(mod)
+        cage_on = cage is not None and not cage.hide_viewport
+        op = row.operator("skin_jiggle.cage_toggle",
+                          text="Fast Preview Cage: On" if cage_on
+                          else "Fast Preview Cage",
+                          icon='MESH_ICOSPHERE', depress=cage_on)
+        op.modifier_name = mod.name
+        if cage is not None:
+            op = row.operator("skin_jiggle.cage_delete", text="", icon='TRASH')
+            op.modifier_name = mod.name
+
+        for sid, label, icon, names in _LAYER_SECTIONS:
+            # Limits stay open: Contact Reach is the fix for clipping skin
+            header, body = layout.panel(
+                f"sj_{sid}", default_closed=sid not in {"motion", "limits"})
+            header.label(text=label, icon=icon)
+            if body is None:
+                continue
+            # names inside full-width fields: split labels get cut off
+            # in a narrow sidebar ("Max Str...")
+            col = body.column(align=True)
+            for name in names:
+                ident = ident_map.get(name)
+                if ident is not None:
+                    col.prop(mod, f'["{ident}"]', text=name)
+            if sid == "limits":
+                tip = body.column(align=True)
+                tip.scale_y = 0.8
+                if ident_map.get("Contact Reach") is None:
+                    tip.label(text="Upgrade the layer to get Contact Reach",
+                              icon='ERROR')
+                else:
+                    tip.label(text="Skin clipping into a collider?", icon='INFO')
+                    tip.label(text="Raise Contact Reach.", icon='BLANK1')
+                    tip.label(text="Max Stretch: jiggle only.",
+                              icon='BLANK1')
+
+
+class VIEW3D_PT_skin_jiggle_colliders(_SJPanel, Panel):
+    bl_label = "Colliders"
+    bl_parent_id = "VIEW3D_PT_skin_jiggle"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        colliders = [ob for ob in context.scene.objects if _is_collider(ob)]
+        row = layout.row(align=True)
+        row.operator('skin_jiggle.add_collider', text="Add Hand Collider",
+                     icon='ADD')
+        row.operator("skin_jiggle.sync_colliders", text="",
+                     icon='FILE_REFRESH')
+        if not colliders:
+            col = layout.column(align=True)
+            col.scale_y = 0.8
+            col.label(text="Any mesh with Physics > Collision", icon='INFO')
+            col.label(text="is a collider. None in this scene yet.")
+            return
+        for collider in colliders:
+            box = layout.box()
+            box.prop(collider, 'name', text='', emboss=False,
+                     icon='VIEW_PAN' if collider.get('sj_managed_collider')
+                     else 'MESH_DATA')
+            col = box.column(align=True)
+            col.use_property_split = True
+            col.use_property_decorate = False
+            col.prop(collider.collision, 'thickness_outer', text='Thickness')
+            col.prop(collider.collision, 'cloth_friction', text='Friction')
+            col.prop(collider.collision, 'damping', text='Damping')
+
+
+class VIEW3D_PT_skin_jiggle_sim(_SJPanel, Panel):
+    bl_label = "Simulation & Bake"
+    bl_parent_id = "VIEW3D_PT_skin_jiggle"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        col = layout.column(align=True)
+        col.operator("skin_jiggle.reset", icon='FILE_REFRESH')
         row = col.row(align=True)
         row.operator("skin_jiggle.bake", icon='RENDER_ANIMATION')
         row.operator("skin_jiggle.free_bake", text="", icon='TRASH')
-
-        row = col.row(align=True)
-        row.prop(context.scene, "sj_cage_ratio", text="Cage Ratio")
-
-        n_col = sum(1 for ob in context.scene.objects if _is_collider(ob))
-        row = col.row(align=True)
-        row.label(text=f"Colliders: {n_col}", icon='PHYSICS')
-        row.operator('skin_jiggle.add_collider', text='', icon='ADD')
-        row.operator("skin_jiggle.sync_colliders", text="",
-                     icon='FILE_REFRESH')
-
-        if n_col:
-            collider_box = layout.box()
-            collider_box.label(text='Collision Objects', icon='MESH_UVSPHERE')
-            for collider in (ob for ob in context.scene.objects if _is_collider(ob)):
-                name_row = collider_box.row(align=True)
-                name_row.prop(collider, 'name', text='', emboss=False)
-                name_row.label(text='(Hand)' if collider.get('sj_managed_collider') else '')
-                contact = collider_box.row(align=True)
-                contact.prop(collider.collision, 'thickness_outer', text='Thickness')
-                contact.prop(collider.collision, 'cloth_friction', text='Friction')
-                contact.prop(collider.collision, 'damping', text='Damping')
-
-        mods = _jiggle_modifiers(obj)
-        if not mods:
-            layout.separator()
-            layout.label(text="No jiggle layers yet.", icon='DOT')
-            layout.label(text="Each layer = one vertex group.")
-            return
-
-        n_old = len(_old_layers(obj))
-        if n_old:
-            box = layout.box()
-            box.alert = True
-            box.label(text=f"{n_old} layer(s) use an older engine",
-                      icon='ERROR')
-            box.operator("skin_jiggle.upgrade_layers", icon='FILE_REFRESH')
-
-        for mod in mods:
-            ng = mod.node_group
-            ident_map = _input_ident_map(ng)   # per layer: groups may differ
-
-            box = layout.box()
-            header = box.row(align=True)
-            header.prop(mod, "show_expanded", text="", emboss=False,
-                        icon='TRIA_DOWN' if mod.show_expanded
-                        else 'TRIA_RIGHT')
-            header.label(text=mod.name, icon='MOD_SIMPLEDEFORM')
-            vp_icon = 'PAUSE' if mod.show_viewport else 'PLAY'
-            header.prop(mod, "show_viewport", text="", icon=vp_icon,
-                        emboss=False)
-            op = header.operator("skin_jiggle.remove_layer", text="",
-                                 icon='X', emboss=False)
-            op.modifier_name = mod.name
-
-            w_ident = ident_map.get("Weight")
-            vg_name = mod.get(f"{w_ident}_attribute_name", "") \
-                if w_ident else ""
-            sub = box.row()
-            if vg_name in obj.vertex_groups:
-                sub.label(text=f"Vertex Group:  {vg_name}",
-                          icon='GROUP_VERTEX')
-            else:
-                # renamed / deleted group: the layer silently does nothing
-                warn = sub.row(align=True)
-                warn.alert = True
-                warn.label(text=f"Missing group '{vg_name or '<none>'}'",
-                           icon='ERROR')
-                op = warn.operator("skin_jiggle.set_group", text="Pick")
-                op.modifier_name = mod.name
-            cage = _layer_cage(mod)
-            cage_on = cage is not None and not cage.hide_viewport
-            op = sub.operator("skin_jiggle.cage_toggle", text="",
-                              icon='MESH_ICOSPHERE', depress=cage_on)
-            op.modifier_name = mod.name
-            if cage is not None:
-                op = sub.operator("skin_jiggle.cage_delete", text="",
-                                  icon='TRASH')
-                op.modifier_name = mod.name
-            op = sub.operator("skin_jiggle.apply_preset", text="Preset",
-                              icon='PRESET')
-            op.modifier_name = mod.name
-            style = mod.get('sj_contact_style', 'BODY')
-            style_label = next((label for ident, label, _ in _CONTACT_STYLES
-                                if ident == style), 'Body preset')
-            op = sub.operator('skin_jiggle.contact_style',
-                              text=style_label, icon='PHYSICS')
-            op.modifier_name = mod.name
-
-            if not mod.show_expanded:
-                continue
-
-            for section, names in _PANEL_ORDER:
-                sec = box.column(align=True)
-                sec.label(text=section)
-                for name in names:
-                    ident = ident_map.get(name)
-                    if ident is None:
-                        continue
-                    sec.prop(mod, f'["{ident}"]', text=name)
-                box.separator(factor=0.4)
+        layout.operator("skin_jiggle.reset_defaults", icon='LOOP_BACK')
+        col = layout.column()
+        col.use_property_split = True
+        col.use_property_decorate = False
+        col.prop(context.scene, "sj_cage_ratio", text="Cage Ratio")
 
 
 # ===========================================================================
@@ -2219,7 +2398,11 @@ _CLASSES = (
     SJ_OT_reset,
     SJ_OT_bake,
     SJ_OT_free_bake,
+    SJ_UL_layers,
     VIEW3D_PT_skin_jiggle,
+    VIEW3D_PT_skin_jiggle_layer,
+    VIEW3D_PT_skin_jiggle_colliders,
+    VIEW3D_PT_skin_jiggle_sim,
 )
 
 def _anim_mode_update(self, context):
@@ -2237,6 +2420,8 @@ def _anim_mode_update(self, context):
 def register():
     for c in _CLASSES:
         bpy.utils.register_class(c)
+    bpy.types.Object.sj_active_layer = bpy.props.IntProperty(
+        name="Active Jiggle Layer", default=0, min=0)
     bpy.types.Scene.sj_cage_ratio = bpy.props.FloatProperty(
         name="Cage Ratio",
         description="Decimation ratio used when creating a preview cage "
@@ -2262,6 +2447,7 @@ def unregister():
         bpy.app.timers.unregister(_repair_timer)
     del bpy.types.Scene.sj_anim_mode
     del bpy.types.Scene.sj_cage_ratio
+    del bpy.types.Object.sj_active_layer
     for c in reversed(_CLASSES):
         bpy.utils.unregister_class(c)
 
