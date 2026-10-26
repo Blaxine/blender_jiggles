@@ -1,4 +1,4 @@
-"""Live 25-preset x 4-style contact sweep.
+"""Live preset x 4-style contact sweep.
 
 Run via: blender --background --factory-startup --python-exit-code 1
          --python tests/collision_sweep.py
@@ -130,3 +130,5 @@ for style in styles:
           f"release overshoot "
           f"{max(r['release_overshoot_mm'] for r in subset):.2f} mm", flush=True)
 sj.unregister()
+assert rows, 'No collision profiles evaluated'
+assert max_pen <= 0.1, f'Collision penetration {max_pen:.4f} mm exceeds 0.1 mm tolerance'

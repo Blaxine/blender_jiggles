@@ -37,7 +37,7 @@
 bl_info = {
     "name": "Skin Jiggle Physics",
     "author": "Claude (Anthropic)",
-    "version": (1, 13, 0),
+    "version": (1, 13, 1),
     "blender": (4, 1, 0),
     "location": "3D Viewport > Sidebar (N) > Jiggle",
     "description": "High-end vertex-group soft tissue / skin jiggle physics "
@@ -48,6 +48,8 @@ bl_info = {
 import bpy
 import math
 import logging
+import os
+import uuid
 from bpy.types import Operator, Panel
 from bpy.props import BoolProperty, EnumProperty, StringProperty
 from bpy.app.handlers import persistent
@@ -55,7 +57,7 @@ from mathutils import Matrix
 
 CORE_NAME = "SkinJiggleCore"
 SJ_COLL = "SJ_Colliders"
-BUILD_TAG = "1.13.0"
+BUILD_TAG = "1.13.1"
 _LOG = logging.getLogger(__name__)
 SAG_FRACTION = 0.5   # gravity sag may use at most this share of Max Stretch
 
@@ -102,7 +104,7 @@ _SOCKET_DEFS = [
     ("Fold Iterations", 'NodeSocketInt', 2, 0, 10, 'NONE',
      "Smoothing spread. More iterations = broader, softer folds"),
     ("Blend", 'NodeSocketFloat', 1.0, 0.0, 1.0, 'FACTOR',
-     "Global fade of the whole effect (animatable)"),
+     "Fade free jiggle motion (animatable); resolved contacts remain protected, even at zero"),
     ("Floor Collision", 'NodeSocketBool', False, None, None, 'NONE',
      "Collide dynamic tissue with a world-space horizontal floor"),
     ("Floor Height", 'NodeSocketFloat', 0.0, -10000.0, 10000.0, 'DISTANCE',
@@ -1142,6 +1144,9 @@ def _build_core_group():
     offset_scaled = VM('SCALE',
                        VM('ADD', smooth_offset, bulge_vec),
                        gi_post.outputs['Blend'])
+    # Strength and display bulges must not undo an already resolved contact.
+    # Zero-weight vertices are excluded from sj_touch and remain pinned.
+    offset_scaled = SWITCHV(touch_now, offset_scaled, offset)
     # Smoothing and squash are display effects; they must respect the same
     # world-distance limit as the solver, including on scaled objects. The
     # limit grows by however far a collider pushed the vertex past Max
@@ -2253,11 +2258,24 @@ def _ensure_bake_dirs(objects):
     start with an empty one, and Blender 4.1 then 'bakes' without writing
     anything. Layers share one node group, hence one bake id, so the folder
     must be unique per object and layer or they would overwrite each other."""
-    for ob in objects:
+    targets = list(objects)
+    def path_key(path):
+        return os.path.normcase(os.path.realpath(bpy.path.abspath(path)))
+
+    # Reserve paths outside this operation first, including copied modifiers.
+    used = {path_key(mod.bake_directory)
+            for ob in bpy.data.objects if ob not in targets
+            for mod in _jiggle_modifiers(ob)
+            if getattr(mod, 'bake_directory', '')}
+    for ob in targets:
         for mod in _jiggle_modifiers(ob):
-            if hasattr(mod, "bake_directory") and not mod.bake_directory:
-                mod.bake_directory = (f"//sj_bake/{bpy.path.clean_name(ob.name)}"
-                                      f"_{bpy.path.clean_name(mod.name)}/")
+            if not hasattr(mod, "bake_directory"):
+                continue
+            path = mod.bake_directory
+            if not path or path_key(path) in used:
+                path = f"//sj_bake/{uuid.uuid4().hex}/"
+                mod.bake_directory = path
+            used.add(path_key(path))
 
 
 def _run_cache_operator(context, operator):

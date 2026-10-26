@@ -1,4 +1,4 @@
-# Validation — version 1.13.0
+# Validation — version 1.13.1
 
 Validated with the installed Blender **4.1.1** and **5.1.2** executables using
 factory-startup background sessions. No existing user scenes were opened or
@@ -28,7 +28,11 @@ on a rig that was just moved.
 
 The regression script checks:
 
-- The generated 455-node graph builds and is reusable.
+- The generated 456-node graph builds and is reusable.
+- Floor contacts remain resolved at Strength 0, 0.25 and 1; pinned vertices
+  stay fixed. Cube contacts remain resolved at Strength 0 and 0.25.
+- Copied bake paths are separated without changing the original path, and
+  remain stable when both objects are prepared again.
 - All 29 presets (25 body, 4 material) match their declared frequency and
   damping ratio, stay
   within every exposed parameter range, and avoid the stiffness stability

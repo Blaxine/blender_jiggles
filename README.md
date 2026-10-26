@@ -1,4 +1,4 @@
-# Skin Jiggle Physics 1.13.0 — Blender 4.1+ Addon
+# Skin Jiggle Physics 1.13.1 — Blender 4.1+ Addon
 
 Vertex-group-driven soft tissue simulation built on **Geometry Nodes
 Simulation Zones**. Each jiggle layer is one Geometry Nodes modifier masked
@@ -69,7 +69,8 @@ delete the group, its row in the layer list turns red — click the
 - **Layer Settings** — for the selected layer:
   - **Group**, **Preset** and **Contact** buttons show the current choice;
     click to change it.
-  - **Strength** fades the whole layer (animatable).
+  - **Strength** fades free jiggle motion (animatable). Resolved contacts
+    stay protected even at zero; disable the modifier to turn off the layer.
   - A one-line read-out of how the layer feels, e.g. *Bouncy, 2.6 Hz* and
     how far the jiggle may travel.
   - **Fast Preview Cage** for heavy meshes.
@@ -310,7 +311,7 @@ in the impact/friction calculation; fast moving props remain an approximation.
 Painted pins (weight 0) take priority over contact clearance. A collider
 may push skin up to Max Stretch + **Contact Reach** from its animated
 position; if the pose penetrates deeper than that, raise Contact Reach.
-Strength (Blend) below 1 also scales the contact push down.
+Strength (Blend) below 1 preserves resolved contact pushes, including at zero.
 
 ## Performance & Animation Mode (v1.5)
 
@@ -418,9 +419,9 @@ start frame, which clears the live cache.
   node layout is auto-generated (a grid) but fully inspectable/editable
   if you want to extend it.
 
-## Upgrading to 1.13.0
+## Upgrading to 1.13.1
 
-- Install `dist/skin_jiggle_physics_1.13.0.zip` and press **Upgrade Layers**
+- Install `dist/skin_jiggle_physics_1.13.1.zip` and press **Upgrade Layers**
   on armatures with jiggle bones to get **Stretch Amount**; **Volume** works
   on existing Squash & Stretch bones right away.
 - Fixes jiggle bones added right after an armature was moved (e.g. by a

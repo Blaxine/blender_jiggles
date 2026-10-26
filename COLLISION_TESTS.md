@@ -1,4 +1,4 @@
-# Animated collision sweep — 1.11.0
+# Animated collision sweep — 1.13.1
 
 The collision harness in `tests/collision_sweep.py` evaluates all **29
 presets (25 body + 4 material) × 4 contact styles** with Blender's live Geometry Nodes simulation.
@@ -14,7 +14,12 @@ Run from the project root:
 blender --background --factory-startup --python-exit-code 1 --python tests/collision_sweep.py
 ```
 
-## Results (1.11.0, Blender 4.1.1)
+## Results (1.13.1, Blender 5.1.2)
+
+Re-run for 1.13.1: all 116 profiles pass. The script now fails if measured
+penetration exceeds 0.1 mm, after writing the diagnostic CSV. The mesh
+regression suite separately checks reduced Strength and pinned vertices on
+Blender 4.1.1 and 5.1.2.
 
 | Contact style | Profiles | Worst measured penetration | Mean peak travel | Worst release overshoot |
 |---|---:|---:|---:|---:|

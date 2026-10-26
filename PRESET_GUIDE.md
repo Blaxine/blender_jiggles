@@ -140,8 +140,9 @@ impact response. Apply sheared parent transforms before judging accuracy.
 Zero-weight vertices remain fixed. Max Stretch caps the jiggle (springs,
 smoothing and squash); collisions may push up to Contact Reach further. If
 contact clearance needs more than Max Stretch + Contact Reach, raise Contact
-Reach rather than Max Stretch, so the jiggle keeps its limit. Partial Blend
-(Strength) also scales the contact push down.
+Reach rather than Max Stretch, so the jiggle keeps its limit. Since 1.13.1,
+Blend (Strength) fades free jiggle while preserving resolved contacts, even
+at zero. Disable the modifier to turn off contact protection as well.
 
 ## Calibrating a character
 

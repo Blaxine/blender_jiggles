@@ -99,7 +99,31 @@ for frame in range(2, 8):
 assert all((v - ob.matrix_world @ ob.data.vertices[i].co).length <= .02501
            for i, v in enumerate(coords)), ('stretch exceeded', coords)
 values(mod, Contact_Reach=reach)
+for strength in (0.0, 0.25, 1.0):
+    values(mod, Blend=strength)
+    scene.frame_set(1)
+    for frame in range(2, 8):
+        scene.frame_set(frame)
+        coords = positions(ob)
+    assert abs(coords[0].z) < 1e-6, ('Strength moved pinned vertex', strength)
+    assert all(v.z >= .05 - 1e-4 for v in coords[1:]), ('Strength weakened floor contact', strength, coords)
 print('SJ_CHECK: playback, pinned mask, contact reach and stretch limit pass', flush=True)
+
+# Duplicated modifiers can inherit explicit bake paths. Keep the original's
+# cache and assign independent storage to the copy, stable across calls.
+bake_copy = ob.copy()
+bpy.context.scene.collection.objects.link(bake_copy)
+mod.bake_directory = '//sj_bake/shared_test/'
+copy_bake_mod = sj._jiggle_modifiers(bake_copy)[0]
+copy_bake_mod.bake_directory = mod.bake_directory
+sj._ensure_bake_dirs([bake_copy])
+assert copy_bake_mod.bake_directory != mod.bake_directory
+copy_path = copy_bake_mod.bake_directory
+sj._ensure_bake_dirs([ob, bake_copy])
+assert copy_bake_mod.bake_directory == copy_path
+assert mod.bake_directory == '//sj_bake/shared_test/'
+bpy.data.objects.remove(bake_copy, do_unlink=True)
+print('SJ_CHECK: copied bake paths separated and stable', flush=True)
 
 for key, (_, preset_values) in sj.PRESETS.items():
     sj._apply_preset(mod, ng, key)
@@ -197,7 +221,7 @@ for index, scale in enumerate(((1, 1, 1), (.5, 2, 3))):
     probe.scale = scale
     pm = layer(probe, [1] * 4)
     values(pm, Gravity=0, Fold_Smoothing=0, Squash_Amount=0,
-           Max_Stretch=.2, Collision_Distance=.002)
+           Max_Stretch=.2, Collision_Distance=.002, Blend=0.25 * index)
     probes.append(probe)
 sj._sync_colliders(collision_scene)
 for frame in range(1, 10):
