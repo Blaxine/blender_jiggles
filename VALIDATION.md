@@ -36,7 +36,8 @@ The regression script checks:
   remain stable when both objects are prepared again. This holds whichever
   is prepared first: re-baking the original after copying it keeps its
   folder, and a preview cage never takes its layer's folder, even after its
-  settings are synced back to the layer.
+  settings are synced back to the layer. Syncing also copies whether each
+  input reads an attribute or its value.
 - Reset All restores Soft Skin values together with the preset and contact
   style labels.
 - All 232 preset x contact style x bone combinations leave distinct socket
@@ -52,7 +53,9 @@ The regression script checks:
 - A layer without stored labels (a file from an earlier version) shows them
   from its values, counts edits as "+N" but not a lowered Strength, and
   Contact Style uses its own preset's contact defaults instead of Soft Skin's.
-  When the preset cannot be told, Contact Style refuses.
+  When the preset cannot be told, the Contact Style dialog asks whose
+  contact defaults to scale and keeps the layer's edits; without that
+  answer it refuses.
 - All 29 presets (25 body, 4 material) match their declared frequency and
   damping ratio, stay
   within every exposed parameter range, and avoid the stiffness stability

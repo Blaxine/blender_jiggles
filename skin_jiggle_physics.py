@@ -1228,6 +1228,13 @@ def _input_attribute(mod, ident):
         return mod.get(f"{ident}_attribute_name", "")
     return getattr(_input_slot(mod, ident), "attribute_name", "")
 
+def _uses_attribute(mod, ident):
+    # the attribute name is kept after switching back to a value, so it
+    # does not tell which one the input reads
+    if not _INPUT_RNA:
+        return bool(mod.get(f"{ident}_use_attribute"))
+    return getattr(_input_slot(mod, ident), "type", 'VALUE') == 'ATTRIBUTE'
+
 def _draw_input(layout, mod, ident, **kw):
     slot = _input_slot(mod, ident)
     if slot is not None:
@@ -1263,6 +1270,16 @@ def _use_attribute(mod, ident, name):
     mod[key] = True if isinstance(mod.get(key), bool) else 1
     mod[f"{ident}_attribute_name"] = name
 
+def _use_value(mod, ident):
+    if _INPUT_RNA:
+        slot = _input_slot(mod, ident)
+        if slot is not None:
+            slot.type = 'VALUE'
+        return
+    key = f"{ident}_use_attribute"
+    if key in mod:
+        mod[key] = False if isinstance(mod[key], bool) else 0
+
 def _set_vertex_group(mod, ng, group_name):
     ident = _input_ident_map(ng).get("Weight")
     if ident is not None:
@@ -1283,8 +1300,10 @@ def _copy_inputs(src, dst):
             _put_input(dst, ident, value)
         except (TypeError, KeyError, ValueError, AttributeError):
             pass
-        if _input_attribute(src, ident):
+        if _uses_attribute(src, ident):
             _use_attribute(dst, ident, _input_attribute(src, ident))
+        elif _uses_attribute(dst, ident):
+            _use_value(dst, ident)
 
 
 # The add-on's own per-layer data. It lived on the modifier, which 5.2 no
@@ -1594,8 +1613,7 @@ def _apply_preset(mod, ng, preset_key):
 
 def _contact_values(preset_key, style):
     """Collision response of a contact style on top of a body preset."""
-    base = _CONTACT_PRESET_BASE.get(preset_key, _CONTACT_PRESET_BASE['SOFT_SKIN'])
-    gap, friction, squash, bounce, spread = base
+    gap, friction, squash, bounce, spread = _CONTACT_PRESET_BASE[preset_key]
     if style == 'HAND':
         gap, friction, squash, bounce, spread = gap * .8, min(friction * 1.2, 1.0), squash * 1.25, bounce * .4, min(spread + 1, 16)
     elif style == 'GRIP':
@@ -1997,13 +2015,27 @@ class SJ_OT_contact_style(Operator):
     modifier_name: StringProperty()
     object_name: StringProperty(options={'HIDDEN'})
     style: EnumProperty(name='Style', items=_CONTACT_STYLES, default='BODY')
+    # Asked for only when the layer's preset cannot be told, so a layer with
+    # many edits does not have to lose them to a preset first
+    preset: EnumProperty(name='Defaults of', items=_PRESET_ENUM,
+                         default='SOFT_SKIN')
+    pick_preset: BoolProperty(options={'HIDDEN', 'SKIP_SAVE'})
 
     def invoke(self, context, event):
         _obj, mod = _target_layer(context, self.object_name, self.modifier_name)
         if mod is not None and mod.node_group:
             self.modifier_name = mod.name
-            self.style = _layer_labels(mod)[1] or 'BODY'
+            preset, style, _n, _m = _layer_labels(mod)
+            self.style = style or 'BODY'
+            self.pick_preset = preset is None
         return context.window_manager.invoke_props_dialog(self, width=340)
+
+    def draw(self, context):
+        self.layout.prop(self, 'style')
+        if self.pick_preset:
+            self.layout.label(text="Preset unknown: scale the contact of",
+                              icon='INFO')
+            self.layout.prop(self, 'preset')
 
     def execute(self, context):
         obj, mod = _target_layer(context, self.object_name, self.modifier_name)
@@ -2013,6 +2045,8 @@ class SJ_OT_contact_style(Operator):
         # A style scales its preset's contact defaults. Files from earlier
         # versions lost the stored preset; never assume Soft Skin's instead.
         key = _layer_labels(mod)[0]
+        if key is None and self.pick_preset:
+            key = self.preset
         if key is None:
             self.report({'ERROR'}, 'Cannot tell which preset this layer uses; '
                                   'apply a preset first')
@@ -2689,9 +2723,9 @@ class SJ_OT_bone_stretch(Operator):
 # ===========================================================================
 #  UI
 # ===========================================================================
-def _layer_group(mod):
+def _layer_group(mod, ident_map=None):
     """Name of the vertex group driving a layer ('' if none)."""
-    ident = _input_ident_map(mod.node_group).get("Weight")
+    ident = (ident_map or _input_ident_map(mod.node_group)).get("Weight")
     return _input_attribute(mod, ident) if ident else ""
 
 
@@ -2704,10 +2738,14 @@ def _active_layer(obj):
     return mods[0] if mods else None
 
 
-def _feel_summary(mod):
-    """Plain-language read-out of a layer's spring: feel, Hz and travel."""
-    v = {name: _get_input(mod, ident)
-         for name, ident in _input_ident_map(mod.node_group).items()}
+def _layer_values(mod, ident_map=None):
+    ident_map = ident_map or _input_ident_map(mod.node_group)
+    return {name: _get_input(mod, ident) for name, ident in ident_map.items()}
+
+
+def _feel_summary(v):
+    """Plain-language read-out of a layer's spring (its _layer_values):
+    feel, Hz and travel."""
     try:
         k_n = v["Stiffness"] * max(1.0 - v["Normal Softness"], 0.02)
         omega = math.sqrt(k_n / max(v["Mass"], 1e-4))
@@ -2721,18 +2759,13 @@ def _feel_summary(mod):
             f"Jiggle travel up to {travel:.1f} cm")
 
 
-def _layer_values(mod):
-    return {name: _get_input(mod, ident)
-            for name, ident in _input_ident_map(mod.node_group).items()}
-
-
-def _layer_labels(mod):
+def _layer_labels(mod, values=None):
     """(preset, contact style, preset fields edited, contact fields edited).
     The labels stored when they were applied win; values decoded from the
     sockets fill the gaps (files from earlier versions lost the stored
     ones). Edits count against what the preset and style wrote, except
     Strength, which the layer list shows on its own."""
-    values = _layer_values(mod)
+    values = values or _layer_values(mod)
     bone = _is_bone_layer(mod)
     preset = _layer_meta(mod, 'sj_body_preset')
     if preset not in PRESETS:
@@ -2751,10 +2784,10 @@ def _layer_labels(mod):
             edits(_CONTACT_FIELDS) if style else 0)
 
 
-def _label_texts(mod):
+def _label_texts(mod, values=None):
     """Preset and contact button texts: 'Chest — D cup +2' when two of the
     values it wrote were changed since, 'Custom' when it is unknown."""
-    preset, style, n_preset, n_contact = _layer_labels(mod)
+    preset, style, n_preset, n_contact = _layer_labels(mod, values)
 
     def text(label, n):
         return f"{label} +{n}" if n else label
@@ -2764,8 +2797,13 @@ def _label_texts(mod):
             text(contact, n_contact) if contact else "Custom")
 
 
-def _preset_label(mod):
-    return _label_texts(mod)[0]
+def _strength_chip(strength):
+    """Layer list text for a changed Strength ('' when it is 100 %)."""
+    if _same_value(strength, 1.0):
+        return ""
+    # never round a changed Strength to the 100 % it is not
+    pct = round(strength * 100)
+    return f"{min(pct, 99) if strength < 1 else max(pct, 101)}%"
 
 
 class SJ_UL_layers(bpy.types.UIList):
@@ -2780,7 +2818,8 @@ class SJ_UL_layers(bpy.types.UIList):
 
     def draw_item(self, context, layout, data, item, icon, active_data,
                   active_propname, index):
-        group = _layer_group(item)
+        ident_map = _input_ident_map(item.node_group)
+        group = _layer_group(item, ident_map)
         missing = group not in data.vertex_groups
         row = layout.row(align=True)
         name = row.row(align=True)
@@ -2791,10 +2830,11 @@ class SJ_UL_layers(bpy.types.UIList):
         if cage is not None and not cage.hide_viewport:
             row.label(text="", icon='MESH_ICOSPHERE')
         # a lowered Strength is a common edit; the preset label ignores it
-        ident = _input_ident_map(item.node_group).get("Blend")
+        ident = ident_map.get("Blend")
         strength = _get_input(item, ident) if ident else None
-        if strength is not None and not _same_value(strength, 1.0):
-            row.label(text=f"{strength:.0%}")
+        chip = _strength_chip(strength) if strength is not None else ""
+        if chip:
+            row.label(text=chip)
         row.prop(item, "show_viewport", text="", emboss=False)
 
 
@@ -2922,7 +2962,7 @@ def _draw_layer_settings(layout, obj, mod, pb=None):
         return split
 
     if pb is None:
-        group = _layer_group(mod)
+        group = _layer_group(mod, ident_map)
         missing = group not in obj.vertex_groups
         row = labelled("Group")
         row.alert = missing
@@ -2934,7 +2974,8 @@ def _draw_layer_settings(layout, obj, mod, pb=None):
     else:
         row = labelled("Bone")
         row.label(text=pb.name, icon='BONE_DATA')
-    preset_text, contact_text = _label_texts(mod)
+    values = _layer_values(mod, ident_map)
+    preset_text, contact_text = _label_texts(mod, values)
     row = labelled("Preset")
     op = row.operator("skin_jiggle.apply_preset", text=preset_text, icon='PRESET')
     op.modifier_name = mod.name
@@ -2949,7 +2990,7 @@ def _draw_layer_settings(layout, obj, mod, pb=None):
     if ident:
         _draw_input(layout, mod, ident, text="Strength", slider=True)
 
-    summary = _feel_summary(mod)
+    summary = _feel_summary(values)
     if summary:
         col = layout.column(align=True)
         col.scale_y = 0.85

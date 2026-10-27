@@ -214,7 +214,7 @@ bpy.context.view_layer.objects.active = ob
 assert bpy.ops.skin_jiggle.reset_defaults() == {'FINISHED'}
 assert sj._layer_meta(mod, 'sj_body_preset') == 'SOFT_SKIN', sj._layer_meta(mod, 'sj_body_preset')
 assert sj._layer_meta(mod, 'sj_contact_style') == 'BODY', sj._layer_meta(mod, 'sj_contact_style')
-assert sj._preset_label(mod) == 'Soft Skin'
+assert sj._label_texts(mod)[0] == 'Soft Skin'
 idents = sj._input_ident_map(ng)
 for name, value in sj.PRESETS['SOFT_SKIN'][1].items():
     assert math.isclose(sj._get_input(mod, idents[name]), value, rel_tol=1e-5), (name, sj._get_input(mod, idents[name]), value)
@@ -270,6 +270,18 @@ sj._sync_layer_params(cage, ob)
 sj._ensure_bake_dirs([ob])
 assert mod.bake_directory == layer_path, mod.bake_directory
 print('SJ_CHECK: preview cage never takes its layer\'s bake folder', flush=True)
+# Syncing copies whether an input reads an attribute, not just its name:
+# Blender keeps the name after an input is switched back to a value.
+stiff = sj._input_ident_map(ng)['Stiffness']
+weight = sj._input_ident_map(ng)['Weight']
+sj._use_attribute(cage_mod, stiff, 'Tissue')
+sj._sync_layer_params(cage, ob)
+assert sj._uses_attribute(mod, stiff) and sj._input_attribute(mod, stiff) == 'Tissue'
+sj._use_value(cage_mod, stiff)
+sj._sync_layer_params(cage, ob)
+assert not sj._uses_attribute(mod, stiff)
+assert sj._uses_attribute(mod, weight) and sj._layer_group(mod) == sj._layer_group(cage_mod)
+print('SJ_CHECK: cage sync copies attribute and value modes', flush=True)
 copy = ob.copy()
 scene.collection.objects.link(copy)
 copy_mod = sj._jiggle_modifiers(copy)[0]
@@ -288,7 +300,7 @@ meta_ob = mesh_object('Meta', quad, [(0, 1, 2, 3)])
 mm, _, _ = sj._create_layer(bpy.context, meta_ob, 'Tissue', 'CHEST_D')
 assert sj._meta_slot(mm) in meta_ob[sj._META]
 mm.name = 'Renamed meta layer'
-assert sj._preset_label(mm) == sj.PRESETS['CHEST_D'][0]
+assert sj._label_texts(mm)[0] == sj.PRESETS['CHEST_D'][0]
 # A new layer of a removed one's name (same uid) starts clean.
 sj._set_layer_meta(mm, 'sj_bone', True)
 bpy.context.view_layer.objects.active = meta_ob
@@ -332,7 +344,18 @@ except RuntimeError:
     result = {'CANCELLED'}
 assert result == {'CANCELLED'}
 assert {n: sj._get_input(lm, idents[n]) for n in sj._CONTACT_FIELDS} == live
+# The dialog then asks for the preset, and the edits are kept.
+edits = {n: sj._get_input(lm, idents[n]) for n in sj._PRESET_FIELDS}
+assert bpy.ops.skin_jiggle.contact_style(modifier_name=lm.name, style='STYLIZED',
+                                         pick_preset=True, preset='CHEST_D') == {'FINISHED'}
+assert {n: sj._get_input(lm, idents[n]) for n in sj._PRESET_FIELDS} == edits
+live = {n: sj._get_input(lm, idents[n]) for n in sj._CONTACT_FIELDS}
+want = {n: expected['CHEST_D', 'STYLIZED', False][n] for n in sj._CONTACT_FIELDS}
+assert same_values(live, want), (live, want)
+assert sj._layer_labels(lm) == ('CHEST_D', 'STYLIZED', 4, 0), sj._layer_labels(lm)
 bpy.data.objects.remove(lab_ob, do_unlink=True)
+assert [sj._strength_chip(s) for s in (1.0, .6, .7, .997, 1.004, 0)] == \
+    ['', '60%', '70%', '99%', '101%', '0%']
 print('SJ_CHECK: labels and Contact Style recover the preset from values', flush=True)
 
 # Legacy operator retry must propagate errors to the outer UI handler.
