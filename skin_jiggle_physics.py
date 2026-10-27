@@ -1931,7 +1931,8 @@ def _sync_layer_params(src_obj, dst_obj):
         if dm is None or dm.type != 'NODES':
             continue
         for k in m.keys():
-            if k == "sj_cage":
+            # each object keeps its own cage link and bake-folder ownership
+            if k in {"sj_cage", "sj_bake_owner"}:
                 continue
             try:
                 dm[k] = m[k]
@@ -2221,9 +2222,9 @@ class SJ_OT_reset_defaults(Operator):
                         mod[item.identifier] = float(default)
                 except (TypeError, KeyError):
                     pass
-            if mod.get('sj_bone'):
-                # factory = Soft Skin; bone tips need its isotropic form
-                _apply_preset(mod, ng, 'SOFT_SKIN')
+            # factory = Soft Skin: also resets the preset and contact labels
+            # (and gives bone tips its isotropic form)
+            _apply_preset(mod, ng, 'SOFT_SKIN')
             count += 1
         for o in _layer_objects(obj):
             o.update_tag()
@@ -2257,25 +2258,41 @@ def _ensure_bake_dirs(objects):
     """Give every layer its own bake folder. Modifiers created from Python
     start with an empty one, and Blender 4.1 then 'bakes' without writing
     anything. Layers share one node group, hence one bake id, so the folder
-    must be unique per object and layer or they would overwrite each other."""
+    must be unique per object and layer or they would overwrite each other.
+
+    A copied layer (Shift+D, a preview cage) inherits its source's folder.
+    Each layer records the name of the object that owns its folder, so the
+    owner keeps it and the copy moves, whichever of them is baked first.
+    Without a record (older files) a layer not being prepared keeps it."""
     targets = list(objects)
     def path_key(path):
         return os.path.normcase(os.path.realpath(bpy.path.abspath(path)))
 
-    # Reserve paths outside this operation first, including copied modifiers.
-    used = {path_key(mod.bake_directory)
-            for ob in bpy.data.objects if ob not in targets
-            for mod in _jiggle_modifiers(ob)
-            if getattr(mod, 'bake_directory', '')}
+    def owns(mod):
+        return mod.get('sj_bake_owner') == mod.id_data.name
+
+    holders = {}
+    for ob in bpy.data.objects:
+        for mod in _jiggle_modifiers(ob):
+            if getattr(mod, 'bake_directory', ''):
+                holders.setdefault(path_key(mod.bake_directory), []).append(mod)
     for ob in targets:
         for mod in _jiggle_modifiers(ob):
             if not hasattr(mod, "bake_directory"):
                 continue
             path = mod.bake_directory
-            if not path or path_key(path) in used:
+            key = path_key(path) if path else None
+            others = [m for m in holders.get(key, []) if m != mod]
+            taken = not owns(mod) and any(
+                owns(m) or m.id_data not in targets for m in others)
+            if not path or taken:
+                if key in holders:
+                    holders[key] = others
                 path = f"//sj_bake/{uuid.uuid4().hex}/"
                 mod.bake_directory = path
-            used.add(path_key(path))
+                holders.setdefault(path_key(path), []).append(mod)
+            # stamped at once, so a later target sharing the folder moves
+            mod['sj_bake_owner'] = ob.name
 
 
 def _run_cache_operator(context, operator):

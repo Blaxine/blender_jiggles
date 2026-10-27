@@ -368,9 +368,11 @@ those two effects need vertex density to read.
 
 Use **Bake Simulation** in the panel (wraps Blender's simulation-zone
 bake) once you're happy, so scrubbing and rendering are deterministic.
-Save the .blend first. On Blender 4.x each layer bakes into its own folder,
-`sj_bake/<object>_<layer>/` next to the .blend (Blender 5 packs bakes into
-the file). With an armature selected, all of its jiggle bones are baked.
+Save the .blend first. On Blender 4.x each layer bakes into its own folder
+under `sj_bake/` next to the .blend, with a generated name (Blender 5 packs
+bakes into the file). A copy of a layer (Shift+D, a preview cage) gets its own
+folder when it is baked; the original always keeps its folder and its bake.
+With an armature selected, all of its jiggle bones are baked.
 **Delete Bake** frees it. **Reset Simulation** just jumps to the scene
 start frame, which clears the live cache.
 

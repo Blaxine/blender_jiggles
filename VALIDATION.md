@@ -32,7 +32,12 @@ The regression script checks:
 - Floor contacts remain resolved at Strength 0, 0.25 and 1; pinned vertices
   stay fixed. Cube contacts remain resolved at Strength 0 and 0.25.
 - Copied bake paths are separated without changing the original path, and
-  remain stable when both objects are prepared again.
+  remain stable when both objects are prepared again. This holds whichever
+  is prepared first: re-baking the original after copying it keeps its
+  folder, and a preview cage never takes its layer's folder, even after its
+  settings are synced back to the layer.
+- Reset All restores Soft Skin values together with the preset and contact
+  style labels.
 - All 29 presets (25 body, 4 material) match their declared frequency and
   damping ratio, stay
   within every exposed parameter range, and avoid the stiffness stability

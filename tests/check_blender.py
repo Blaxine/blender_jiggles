@@ -123,6 +123,24 @@ sj._ensure_bake_dirs([ob, bake_copy])
 assert copy_bake_mod.bake_directory == copy_path
 assert mod.bake_directory == '//sj_bake/shared_test/'
 bpy.data.objects.remove(bake_copy, do_unlink=True)
+# Baked first, copied afterwards: preparing the ORIGINAL again (re-bake,
+# Delete Bake) must keep its folder, which holds the bake; the copy moves.
+mod.bake_directory = '//sj_bake/original_test/'
+sj._ensure_bake_dirs([ob])
+bake_copy = ob.copy()
+bpy.context.scene.collection.objects.link(bake_copy)
+copy_bake_mod = sj._jiggle_modifiers(bake_copy)[0]
+# Blender 4.2+ clears the folder on copy; share it as an inherited one would
+copy_bake_mod.bake_directory = mod.bake_directory
+sj._ensure_bake_dirs([ob])
+assert mod.bake_directory == '//sj_bake/original_test/', mod.bake_directory
+sj._ensure_bake_dirs([bake_copy])
+assert copy_bake_mod.bake_directory != mod.bake_directory
+copy_path = copy_bake_mod.bake_directory
+sj._ensure_bake_dirs([ob, bake_copy])
+assert copy_bake_mod.bake_directory == copy_path
+assert mod.bake_directory == '//sj_bake/original_test/'
+bpy.data.objects.remove(bake_copy, do_unlink=True)
 print('SJ_CHECK: copied bake paths separated and stable', flush=True)
 
 for key, (_, preset_values) in sj.PRESETS.items():
@@ -134,7 +152,20 @@ for key, (_, preset_values) in sj.PRESETS.items():
         actual_gap = mod[sj._input_ident_map(ng)['Collision Distance']]
         assert 0 <= actual_gap <= .01
 print(f'SJ_CHECK: all {len(sj.PRESETS) * 4} body/contact profile combinations load', flush=True)
-sj._apply_preset(mod, ng, 'SOFT_SKIN')
+
+# Reset All must reset the preset and contact labels with the values, or the
+# panel shows the old preset and Contact Style uses its contact defaults.
+sj._apply_preset(mod, ng, 'CHEST_D')
+sj._apply_contact_style(mod, 'CHEST_D', 'STYLIZED')
+bpy.context.view_layer.objects.active = ob
+assert bpy.ops.skin_jiggle.reset_defaults() == {'FINISHED'}
+assert mod['sj_body_preset'] == 'SOFT_SKIN', mod['sj_body_preset']
+assert mod['sj_contact_style'] == 'BODY', mod['sj_contact_style']
+assert sj._preset_label(mod) == 'Soft Skin'
+idents = sj._input_ident_map(ng)
+for name, value in sj.PRESETS['SOFT_SKIN'][1].items():
+    assert math.isclose(mod[idents[name]], value, rel_tol=1e-5), (name, mod[idents[name]], value)
+print('SJ_CHECK: Reset All restores Soft Skin values and labels', flush=True)
 
 scene.cursor.location = (5, 5, 5)
 assert bpy.ops.skin_jiggle.add_collider('EXEC_DEFAULT') == {'FINISHED'}
@@ -173,6 +204,19 @@ bpy.context.view_layer.objects.active = ob
 ob.select_set(True)
 cage, error = sj._create_layer_cage(bpy.context, ob, mod, 1.0)
 assert cage is not None, error
+# A cage sharing the layer's bake folder: the layer keeps it, the cage
+# moves, and syncing cage settings back must not hand ownership over.
+cage_mod = cage.modifiers[mod.name]
+cage_mod.bake_directory = mod.bake_directory
+layer_path = mod.bake_directory
+sj._ensure_bake_dirs([ob])
+assert mod.bake_directory == layer_path, mod.bake_directory
+sj._ensure_bake_dirs([cage])
+assert cage_mod.bake_directory != layer_path
+sj._sync_layer_params(cage, ob)
+sj._ensure_bake_dirs([ob])
+assert mod.bake_directory == layer_path, mod.bake_directory
+print('SJ_CHECK: preview cage never takes its layer\'s bake folder', flush=True)
 copy = ob.copy()
 scene.collection.objects.link(copy)
 copy_mod = sj._jiggle_modifiers(copy)[0]
