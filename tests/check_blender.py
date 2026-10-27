@@ -1,8 +1,11 @@
 """Run with Blender --background --factory-startup --python tests/check_blender.py."""
 import importlib.util
+import itertools
 import math
 from pathlib import Path
 import sys
+import tempfile
+import types
 
 import bpy
 
@@ -21,6 +24,10 @@ for key, (_, values) in sj.PRESETS.items():
     omega = math.sqrt(kn / values['Mass'])
     assert math.isclose(omega / (2 * math.pi), f)
     assert math.isclose(values['Damping'] / (2 * omega), zeta)
+    # the panel's settle time: the swing exp(-zeta * omega * t) falls to 5 %
+    settle = math.log(20) / (zeta * 2 * math.pi * f)
+    places = 2 if settle < 1 else 1
+    assert sj._feel_summary(values)[1] == f"Settles in about {settle:.{places}f} s", (key, sj._feel_summary(values))
     for name, _, _, lo, hi, _, _ in sj._SOCKET_DEFS:
         if name in values and lo is not None:
             assert lo <= values[name] <= hi, (key, name, values[name])
@@ -31,6 +38,58 @@ for key, (_, values) in sj.PRESETS.items():
     gap, friction, squash, object_bounce, spread = sj._CONTACT_PRESET_BASE[key]
     assert .0005 <= gap <= .003 and 0 <= friction <= 1
     assert 0 <= object_bounce <= 1 and 0 <= spread <= 16 and squash <= 5
+# Overdamped, the slow creep back sets the settle time; no spring, none.
+creep = dict(values, Stiffness=values['Mass'] * 100, **{'Normal Softness': 0, 'Damping': 50})
+assert sj._feel_summary(creep)[1] == f"Settles in about {math.log(20) / (25 - math.sqrt(525)):.1f} s"
+assert sj._feel_summary(dict(values, Stiffness=0))[1] == "Does not settle (no stiffness)"
+assert 'TIME' in bpy.types.UILayout.bl_rna.functions['label'].parameters['icon'].enum_items
+
+# A layer's preset and contact style can only be recognised from its socket
+# values if no two preset x style x bone combinations leave the same values.
+def same_values(a, b):
+    return all(math.isclose(a[n], b[n], rel_tol=1e-5, abs_tol=1e-9) for n in a)
+
+def largest_difference(a, b):
+    return max((abs(a[n] - b[n]) / max(abs(a[n]), abs(b[n]), 1e-12), n) for n in a)
+
+expected = sj._expected_layers()
+assert len(expected) == len(sj.PRESETS) * len(sj._CONTACT_STYLES) * 2
+clashes = [(x, y) for x, y in itertools.combinations(expected, 2)
+           if same_values(expected[x], expected[y])]
+assert not clashes, clashes
+margin, field, x, y = min(largest_difference(expected[x], expected[y]) + (x, y)
+                          for x, y in itertools.combinations(expected, 2))
+print(f'SJ_CHECK: {len(expected)} preset/style/bone combinations distinct; '
+      f'closest pair {x} vs {y} differs by {margin:.1%} in {field}', flush=True)
+
+# Decoding a layer's labels from its values: every combination decodes to
+# itself, one edited field of any size still gives its preset and style, and
+# two edits may give up (None) but never name a different one.
+def edited(row, name, factor):
+    out, v = dict(row), row[name]
+    if isinstance(v, int):
+        out[name] = v + (1 if factor > 1 else -1)
+    else:
+        out[name] = v * factor if v else .05 * factor
+    return out
+
+factors = (.5, .93, 1.07, 2.0)
+for (key, style, bone), row in expected.items():
+    assert sj._decode_preset(row, bone) == key, (key, style, bone)
+    assert sj._decode_contact(row, key, bone) == style, (key, style, bone)
+    for name, f in itertools.product(sj._CONTACT_FIELDS, factors):
+        assert sj._decode_contact(edited(row, name, f), key, bone) == style, (key, style, bone, name, f)
+gave_up = 0
+for key, bone in itertools.product(sj.PRESETS, (False, True)):
+    row = expected[key, 'BODY', bone]
+    for name, f in itertools.product(sj._PRESET_FIELDS, factors):
+        assert sj._decode_preset(edited(row, name, f), bone) == key, (key, bone, name, f)
+    for (a, b), f in itertools.product(itertools.combinations(sj._PRESET_FIELDS, 2), (.93, 2.0)):
+        found = sj._decode_preset(edited(edited(row, a, f), b, f), bone)
+        assert found in (key, None), (key, bone, a, b, f, found)
+        gave_up += found is None
+print(f'SJ_CHECK: labels decode with any one field edited; two edits gave up '
+      f'{gave_up} of {len(sj.PRESETS) * 2 * 21 * 2} times, never wrong', flush=True)
 
 print('SJ_CHECK: built', len(ng.nodes), 'nodes;', len(sj.PRESETS), 'presets valid', flush=True)
 
@@ -86,7 +145,7 @@ assert abs(coords[0].z) < 1e-6, ('unpainted vertex moved', coords[0])
 assert coords[1].z > .01, ('simulation did not advance', coords)
 # The floor needs 50 mm of travel, Max Stretch allows 25 mm of jiggle:
 # Contact Reach (default 100 mm) lets the collision win instead of clipping.
-reach = mod[sj._input_ident_map(ng)['Contact Reach']]
+reach = sj._get_input(mod, sj._input_ident_map(ng)['Contact Reach'])
 assert all(v.z >= .05 - 1e-4 for v in coords[1:]), ('skin clipped through floor', coords)
 assert all((v - ob.matrix_world @ ob.data.vertices[i].co).length <= .025 + reach + 1e-5
            for i, v in enumerate(coords)), ('contact reach exceeded', coords)
@@ -145,11 +204,15 @@ print('SJ_CHECK: copied bake paths separated and stable', flush=True)
 
 for key, (_, preset_values) in sj.PRESETS.items():
     sj._apply_preset(mod, ng, key)
-    assert mod['sj_body_preset'] == key
+    assert sj._layer_meta(mod, 'sj_body_preset') == key
     for style in ('BODY', 'HAND', 'GRIP', 'STYLIZED'):
         sj._apply_contact_style(mod, key, style)
-        assert mod['sj_contact_style'] == style
-        actual_gap = mod[sj._input_ident_map(ng)['Collision Distance']]
+        assert sj._layer_meta(mod, 'sj_contact_style') == style
+        # the table models exactly what the sockets end up holding
+        idents = sj._input_ident_map(ng)
+        live = {n: sj._get_input(mod, idents[n]) for n in expected[key, style, False]}
+        assert same_values(live, expected[key, style, False]), (key, style)
+        actual_gap = sj._get_input(mod, sj._input_ident_map(ng)['Collision Distance'])
         assert 0 <= actual_gap <= .01
 print(f'SJ_CHECK: all {len(sj.PRESETS) * 4} body/contact profile combinations load', flush=True)
 
@@ -159,12 +222,12 @@ sj._apply_preset(mod, ng, 'CHEST_D')
 sj._apply_contact_style(mod, 'CHEST_D', 'STYLIZED')
 bpy.context.view_layer.objects.active = ob
 assert bpy.ops.skin_jiggle.reset_defaults() == {'FINISHED'}
-assert mod['sj_body_preset'] == 'SOFT_SKIN', mod['sj_body_preset']
-assert mod['sj_contact_style'] == 'BODY', mod['sj_contact_style']
-assert sj._preset_label(mod) == 'Soft Skin'
+assert sj._layer_meta(mod, 'sj_body_preset') == 'SOFT_SKIN', sj._layer_meta(mod, 'sj_body_preset')
+assert sj._layer_meta(mod, 'sj_contact_style') == 'BODY', sj._layer_meta(mod, 'sj_contact_style')
+assert sj._label_texts(mod)[0] == 'Soft Skin'
 idents = sj._input_ident_map(ng)
 for name, value in sj.PRESETS['SOFT_SKIN'][1].items():
-    assert math.isclose(mod[idents[name]], value, rel_tol=1e-5), (name, mod[idents[name]], value)
+    assert math.isclose(sj._get_input(mod, idents[name]), value, rel_tol=1e-5), (name, sj._get_input(mod, idents[name]), value)
 print('SJ_CHECK: Reset All restores Soft Skin values and labels', flush=True)
 
 scene.cursor.location = (5, 5, 5)
@@ -199,6 +262,59 @@ assert col1 is not col2 and count == 0 and len(col2.objects) == 0
 assert a in list(col1.objects) and b in list(col1.objects)
 print('SJ_CHECK: shared mesh settings and scene isolation pass', flush=True)
 
+# Blender's own simulations take an object over after the start frame, so
+# moves made later look undone; the panel says so. Own scene: a rigid body
+# world here would change every later simulation check.
+phys = bpy.data.scenes.new('Physics')
+phys.frame_start = 5
+probe = bpy.data.objects.new('Probe', bpy.data.meshes.new('Probe'))
+probe.data.from_pydata(quad, [], [(0, 1, 2, 3)])
+phys.collection.objects.link(probe)
+probe.modifiers.new('Collision', 'COLLISION')
+assert sj._physics_conflicts(probe, phys) == []
+with bpy.context.temp_override(scene=phys, object=probe, active_object=probe,
+                               selected_objects=[probe],
+                               selected_editable_objects=[probe]):
+    assert bpy.ops.rigidbody.object_add(type='ACTIVE') == {'FINISHED'}
+titles = [t for t, _hint in sj._physics_conflicts(probe, phys)]
+assert titles == ['Rigid Body moves it after frame 5'], titles
+probe.rigid_body.kinematic = True      # Animated: follows its keyframes
+assert sj._physics_conflicts(probe, phys) == []
+probe.rigid_body.kinematic = False
+probe.rigid_body.type = 'PASSIVE'      # stays where it is put
+assert sj._physics_conflicts(probe, phys) == []
+probe.rigid_body.type = 'ACTIVE'
+probe.modifiers.new('Softbody', 'SOFT_BODY')
+titles = [t for t, _hint in sj._physics_conflicts(probe, phys)]
+assert titles == ['Rigid Body moves it after frame 5',
+                  'Soft Body reshapes it after frame 5'], titles
+
+
+class Recorder:
+    """Stand-in layout that keeps the label texts drawn into it."""
+    def __init__(self, texts):
+        self.texts = texts
+
+    def __getattr__(self, name):
+        def call(*args, **kw):
+            if name == 'label':
+                self.texts.append(kw.get('text'))
+            return Recorder(self.texts)
+        return call
+
+
+drawn = []
+sj._draw_warnings(Recorder(drawn), types.SimpleNamespace(scene=phys), probe)
+assert titles[0] in drawn and titles[1] in drawn, drawn
+assert any('Animated' in t for t in drawn), drawn   # the hint is shown
+assert all(len(t) <= 45 for t in drawn), drawn
+drawn = []
+sj._draw_physics_conflicts(Recorder(drawn), probe, phys, hints=False)
+assert drawn == titles, drawn                       # collider list: titles only
+bpy.data.objects.remove(probe, do_unlink=True)
+bpy.data.scenes.remove(phys)
+print('SJ_CHECK: Rigid Body and Soft Body takeovers are flagged', flush=True)
+
 # Duplicate object must never delete its original's cage.
 bpy.context.view_layer.objects.active = ob
 ob.select_set(True)
@@ -217,6 +333,18 @@ sj._sync_layer_params(cage, ob)
 sj._ensure_bake_dirs([ob])
 assert mod.bake_directory == layer_path, mod.bake_directory
 print('SJ_CHECK: preview cage never takes its layer\'s bake folder', flush=True)
+# Syncing copies whether an input reads an attribute, not just its name:
+# Blender keeps the name after an input is switched back to a value.
+stiff = sj._input_ident_map(ng)['Stiffness']
+weight = sj._input_ident_map(ng)['Weight']
+sj._use_attribute(cage_mod, stiff, 'Tissue')
+sj._sync_layer_params(cage, ob)
+assert sj._uses_attribute(mod, stiff) and sj._input_attribute(mod, stiff) == 'Tissue'
+sj._use_value(cage_mod, stiff)
+sj._sync_layer_params(cage, ob)
+assert not sj._uses_attribute(mod, stiff)
+assert sj._uses_attribute(mod, weight) and sj._layer_group(mod) == sj._layer_group(cage_mod)
+print('SJ_CHECK: cage sync copies attribute and value modes', flush=True)
 copy = ob.copy()
 scene.collection.objects.link(copy)
 copy_mod = sj._jiggle_modifiers(copy)[0]
@@ -228,6 +356,70 @@ mod.name = 'Renamed layer'
 assert sj._cage_source(cage) == (ob, mod.name)
 sj._delete_layer_cage(mod)
 print('SJ_CHECK: cage duplicate ownership and rename pass', flush=True)
+
+# Blender 5.2 has no modifier IDProperties: layer data lives on the object
+# under the modifier's uid, which survives renames.
+meta_ob = mesh_object('Meta', quad, [(0, 1, 2, 3)])
+mm, _, _ = sj._create_layer(bpy.context, meta_ob, 'Tissue', 'CHEST_D')
+assert sj._meta_slot(mm) in meta_ob[sj._META]
+mm.name = 'Renamed meta layer'
+assert sj._label_texts(mm)[0] == sj.PRESETS['CHEST_D'][0]
+# A new layer of a removed one's name (same uid) starts clean.
+sj._set_layer_meta(mm, 'sj_bone', True)
+bpy.context.view_layer.objects.active = meta_ob
+assert bpy.ops.skin_jiggle.remove_layer(modifier_name=mm.name) == {'FINISHED'}
+assert not meta_ob[sj._META].keys()
+mm, _, _ = sj._create_layer(bpy.context, meta_ob, 'Tissue', 'SOFT_SKIN')
+assert not sj._is_bone_layer(mm) and sj._layer_group(mm) == 'Tissue'
+bpy.data.objects.remove(meta_ob, do_unlink=True)
+print('SJ_CHECK: layer data follows renames and removal', flush=True)
+
+# Labels and Contact Style on a layer whose stored labels are gone (a file
+# saved by an earlier version) come from its values; Strength is no edit.
+lab_ob = mesh_object('Labels', quad, [(0, 1, 2, 3)])
+lm, _, _ = sj._create_layer(bpy.context, lab_ob, 'Tissue', 'CHEST_D')
+sj._apply_contact_style(lm, 'CHEST_D', 'HAND')
+idents = sj._input_ident_map(ng)
+sj._put_input(lm, idents['Blend'], .6)
+chest_d = sj.PRESETS['CHEST_D'][0]
+assert sj._label_texts(lm) == (chest_d, 'Soft hand'), sj._label_texts(lm)
+sj._clear_layer_meta(lm)
+assert sj._layer_labels(lm) == ('CHEST_D', 'HAND', 0, 0), sj._layer_labels(lm)
+stiffness = sj._get_input(lm, idents['Stiffness'])
+sj._put_input(lm, idents['Stiffness'], 2 * stiffness)
+assert sj._label_texts(lm) == (chest_d + ' +1', 'Soft hand'), sj._label_texts(lm)
+bpy.context.view_layer.objects.active = lab_ob
+assert bpy.ops.skin_jiggle.contact_style(modifier_name=lm.name, style='GRIP') == {'FINISHED'}
+assert sj._layer_meta(lm, 'sj_body_preset') == 'CHEST_D'
+# Chest D's contact defaults, not Soft Skin's
+live = {n: sj._get_input(lm, idents[n]) for n in sj._CONTACT_FIELDS}
+want = {n: expected['CHEST_D', 'GRIP', False][n] for n in sj._CONTACT_FIELDS}
+assert same_values(live, want), (live, want)
+assert sj._label_texts(lm) == (chest_d + ' +1', 'Firm grip'), sj._label_texts(lm)
+# Too many edits to tell the preset: refuse instead of guessing.
+sj._clear_layer_meta(lm)
+for name in ('Damping', 'Mass', 'Max Stretch'):
+    sj._put_input(lm, idents[name], 1.3 * sj._get_input(lm, idents[name]))
+assert sj._label_texts(lm) == ('Custom', 'Custom'), sj._label_texts(lm)
+try:
+    result = bpy.ops.skin_jiggle.contact_style(modifier_name=lm.name, style='STYLIZED')
+except RuntimeError:
+    result = {'CANCELLED'}
+assert result == {'CANCELLED'}
+assert {n: sj._get_input(lm, idents[n]) for n in sj._CONTACT_FIELDS} == live
+# The dialog then asks for the preset, and the edits are kept.
+edits = {n: sj._get_input(lm, idents[n]) for n in sj._PRESET_FIELDS}
+assert bpy.ops.skin_jiggle.contact_style(modifier_name=lm.name, style='STYLIZED',
+                                         pick_preset=True, preset='CHEST_D') == {'FINISHED'}
+assert {n: sj._get_input(lm, idents[n]) for n in sj._PRESET_FIELDS} == edits
+live = {n: sj._get_input(lm, idents[n]) for n in sj._CONTACT_FIELDS}
+want = {n: expected['CHEST_D', 'STYLIZED', False][n] for n in sj._CONTACT_FIELDS}
+assert same_values(live, want), (live, want)
+assert sj._layer_labels(lm) == ('CHEST_D', 'STYLIZED', 4, 0), sj._layer_labels(lm)
+bpy.data.objects.remove(lab_ob, do_unlink=True)
+assert [sj._strength_chip(s) for s in (1.0, .6, .7, .997, 1.004, 0)] == \
+    ['', '60%', '70%', '99%', '101%', '0%']
+print('SJ_CHECK: labels and Contact Style recover the preset from values', flush=True)
 
 # Legacy operator retry must propagate errors to the outer UI handler.
 calls = []
@@ -300,5 +492,25 @@ for fps in (24, 60):
     assert abs(measured / expected - 1) < .15, (fps, measured, expected)
     print('SJ_CHECK: forced response', fps, 'fps:', round(measured, 6),
           'm; analytic:', round(expected, 6), 'm', flush=True)
+
+
+# Last: layer data must survive a save and reload. Blender rebuilds a
+# Geometry Nodes modifier's keys from its node group on load, which
+# dropped it while it lived on the modifier.
+reload_ob = mesh_object('Reload', quad, [(0, 1, 2, 3)])
+rm, _, _ = sj._create_layer(bpy.context, reload_ob, 'Tissue', 'CHEST_D')
+sj._apply_contact_style(rm, 'CHEST_D', 'GRIP')
+stiffness = sj._input_ident_map(ng)['Stiffness']
+sj._put_input(rm, stiffness, 123.0)
+path = Path(tempfile.mkdtemp(prefix='sj_check_')) / 'reload.blend'
+name = rm.name
+bpy.ops.wm.save_as_mainfile(filepath=str(path))
+bpy.ops.wm.open_mainfile(filepath=str(path))
+rm = bpy.data.objects['Reload'].modifiers[name]
+assert sj._layer_meta(rm, 'sj_body_preset') == 'CHEST_D'
+assert sj._layer_meta(rm, 'sj_contact_style') == 'GRIP'
+assert sj._layer_group(rm) == 'Tissue'
+assert math.isclose(sj._get_input(rm, stiffness), 123.0)
+print('SJ_CHECK: layer data survives save and reload', flush=True)
 
 sj.unregister()

@@ -91,6 +91,7 @@ check("body with Collision is not a collider (no cycle)",
 
 # 2 every preset converts to an isotropic bone spring
 bad = []
+table = sjp._expected_layers()
 mod = sjp._jiggle_modifiers(h_br)[0]
 ng = mod.node_group
 im = sjp._input_ident_map(ng)
@@ -98,15 +99,22 @@ for key, (_, vals) in sjp.PRESETS.items():
     r = bpy.ops.skin_jiggle.apply_preset(modifier_name=mod.name,
                                          object_name=h_br.name, preset=key)
     want = vals['Stiffness'] * max(1 - vals['Normal Softness'], .02)
-    if (r != {'FINISHED'} or abs(mod[im['Stiffness']] - want) > 1e-3
-            or mod[im['Normal Softness']] != 0.0 or mod['sj_body_preset'] != key):
+    if (r != {'FINISHED'} or abs(sjp._get_input(mod, im['Stiffness']) - want) > 1e-3
+            or sjp._get_input(mod, im['Normal Softness']) != 0.0 or sjp._layer_meta(mod, 'sj_body_preset') != key
+            or any(not math.isclose(sjp._get_input(mod, im[n]), v, rel_tol=1e-5, abs_tol=1e-9)
+                   for n, v in table[key, 'BODY', True].items())):
         bad.append(key)
 check("all presets apply to a bone as isotropic springs", not bad,
       f"{len(sjp.PRESETS) - len(bad)}/{len(sjp.PRESETS)}")
+bpy.ops.skin_jiggle.apply_preset(modifier_name=mod.name, object_name=h_br.name,
+                                 preset='CHEST_C')
 r = bpy.ops.skin_jiggle.contact_style(modifier_name=mod.name,
                                       object_name=h_br.name, style='GRIP')
 check("contact style targets the bone's helper",
-      r == {'FINISHED'} and mod['sj_contact_style'] == 'GRIP')
+      r == {'FINISHED'} and sjp._layer_meta(mod, 'sj_contact_style') == 'GRIP')
+sjp._clear_layer_meta(mod)
+check("bone layer labels decode from its values without stored ones",
+      sjp._layer_labels(mod)[:2] == ('CHEST_C', 'GRIP'), str(sjp._layer_labels(mod)))
 bpy.ops.skin_jiggle.apply_preset(modifier_name=mod.name, object_name=h_br.name,
                                  preset='JELLY')
 for h in (h_br, h_tip):
@@ -181,7 +189,7 @@ check("stretch toggles Damped Track <-> Stretch To",
 bpy.ops.skin_jiggle.reset_defaults()
 m = sjp._jiggle_modifiers(h_br)[0]
 check("reset defaults: bone layer is isotropic Soft Skin",
-      m[im['Normal Softness']] == 0.0 and m['sj_body_preset'] == 'SOFT_SKIN')
+      sjp._get_input(m, im['Normal Softness']) == 0.0 and sjp._layer_meta(m, 'sj_body_preset') == 'SOFT_SKIN')
 
 # 7 bake from the armature (needs a saved file)
 path = os.path.join(tmpdir, "bone_bake_test.blend")

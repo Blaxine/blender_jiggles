@@ -97,7 +97,7 @@ for frame in range(1, 85):
 rows = []
 expected_min_z = surface_z + .004
 for key, style, ob, mod in cases:
-    gap = mod[sj._input_ident_map(ng)['Collision Distance']]
+    gap = sj._get_input(mod, sj._input_ident_map(ng)['Collision Distance'])
     clearance = expected_min_z + gap
     penetration = max(0.0, clearance - metrics[id(ob)]['min_z'])
     rows.append({

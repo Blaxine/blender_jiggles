@@ -49,6 +49,8 @@ import bpy
 import math
 import logging
 import os
+import struct
+import textwrap
 import uuid
 from bpy.types import Operator, Panel
 from bpy.props import BoolProperty, EnumProperty, StringProperty
@@ -1196,6 +1198,51 @@ def _input_ident_map(ng):
             if getattr(item, "item_type", "") == 'SOCKET'
             and getattr(item, "in_out", "") == 'INPUT'}
 
+# Blender 5.2 removed IDProperties from modifiers: mod[key] raises
+# TypeError. Group inputs moved to RNA structs at
+# mod.properties.inputs.<identifier> (value, type, attribute_name), and the
+# add-on's own keys moved to the object (see _layer_meta). Every access goes
+# through the helpers below so both storages keep working.
+_INPUT_RNA = 'properties' in bpy.types.NodesModifier.bl_rna.properties.keys()
+
+def _input_slot(mod, ident):
+    """The 5.2+ RNA struct of one group input (None on older versions)."""
+    return getattr(mod.properties.inputs, ident, None) if _INPUT_RNA else None
+
+def _get_input(mod, ident, default=None):
+    if not _INPUT_RNA:
+        return mod.get(ident, default)
+    slot = _input_slot(mod, ident)
+    # the Geometry input has no value
+    return getattr(slot, "value", default) if slot is not None else default
+
+def _put_input(mod, ident, value):
+    slot = _input_slot(mod, ident)
+    if slot is not None:
+        slot.value = value
+    elif not _INPUT_RNA:
+        mod[ident] = value
+
+def _input_attribute(mod, ident):
+    """Attribute name an input is set to read ('' if none)."""
+    if not _INPUT_RNA:
+        return mod.get(f"{ident}_attribute_name", "")
+    return getattr(_input_slot(mod, ident), "attribute_name", "")
+
+def _uses_attribute(mod, ident):
+    # the attribute name is kept after switching back to a value, so it
+    # does not tell which one the input reads
+    if not _INPUT_RNA:
+        return bool(mod.get(f"{ident}_use_attribute"))
+    return getattr(_input_slot(mod, ident), "type", 'VALUE') == 'ATTRIBUTE'
+
+def _draw_input(layout, mod, ident, **kw):
+    slot = _input_slot(mod, ident)
+    if slot is not None:
+        layout.prop(slot, "value", **kw)
+    elif not _INPUT_RNA:
+        layout.prop(mod, f'["{ident}"]', **kw)
+
 def _set_value(mod, ng, name, value):
     # cast to the SOCKET's type: an int stored on a float socket (e.g.
     # preset Stiffness 60) is rejected by Blender and the default is used
@@ -1206,25 +1253,99 @@ def _set_value(mod, ng, name, value):
     if item is None:
         return
     if item.socket_type == 'NodeSocketBool':
-        mod[item.identifier] = bool(value)
+        _put_input(mod, item.identifier, bool(value))
     elif item.socket_type == 'NodeSocketInt':
-        mod[item.identifier] = int(value)
+        _put_input(mod, item.identifier, int(value))
     else:
-        mod[item.identifier] = float(value)
+        _put_input(mod, item.identifier, float(value))
 
-def _set_vertex_group(mod, ng, group_name):
-    ident = _input_ident_map(ng).get("Weight")
-    if ident is None:
+def _use_attribute(mod, ident, name):
+    if _INPUT_RNA:
+        slot = _input_slot(mod, ident)
+        if slot is not None:
+            slot.type = 'ATTRIBUTE'
+            slot.attribute_name = name
         return
     key = f"{ident}_use_attribute"
     # int property up to Blender 4.x, bool from 5.0 (which rejects ints)
     mod[key] = True if isinstance(mod.get(key), bool) else 1
-    mod[f"{ident}_attribute_name"] = group_name
+    mod[f"{ident}_attribute_name"] = name
+
+def _use_value(mod, ident):
+    if _INPUT_RNA:
+        slot = _input_slot(mod, ident)
+        if slot is not None:
+            slot.type = 'VALUE'
+        return
+    key = f"{ident}_use_attribute"
+    if key in mod:
+        mod[key] = False if isinstance(mod[key], bool) else 0
+
+def _set_vertex_group(mod, ng, group_name):
+    ident = _input_ident_map(ng).get("Weight")
+    if ident is not None:
+        _use_attribute(mod, ident, group_name)
 
 def _set_object(mod, ng, name, ob):
     ident = _input_ident_map(ng).get(name)
     if ident is not None:
-        mod[ident] = ob
+        _put_input(mod, ident, ob)
+
+def _copy_inputs(src, dst):
+    """Copy every group input's value and attribute between layers."""
+    for ident in _input_ident_map(src.node_group).values():
+        value = _get_input(src, ident)
+        if value is None:
+            continue
+        try:
+            _put_input(dst, ident, value)
+        except (TypeError, KeyError, ValueError, AttributeError):
+            pass
+        if _uses_attribute(src, ident):
+            _use_attribute(dst, ident, _input_attribute(src, ident))
+        elif _uses_attribute(dst, ident):
+            _use_value(dst, ident)
+
+
+# The add-on's own per-layer data. It lived on the modifier, which 5.2 no
+# longer allows. Blender also rebuilds a Geometry Nodes modifier's keys from
+# the node group when a file loads, so it never survived a reload anyway.
+# It now lives on the object under the modifier's persistent uid: that
+# survives renames and is kept by Shift+D and obj.copy(), like the modifier.
+_META = "sj_layer_meta"
+_META_KEYS = ("sj_body_preset", "sj_contact_style", "sj_bone", "sj_cage",
+              "sj_bake_owner")
+
+def _meta_slot(mod):
+    # Blender 4.1 has no persistent_uid
+    return str(getattr(mod, "persistent_uid", mod.name))
+
+def _layer_meta(mod, key, default=None):
+    store = mod.id_data.get(_META)
+    entry = store.get(_meta_slot(mod)) if store is not None else None
+    return entry.get(key, default) if entry is not None else default
+
+def _set_layer_meta(mod, key, value):
+    ob = mod.id_data
+    if _META not in ob:
+        ob[_META] = {}
+    slot = _meta_slot(mod)
+    if slot not in ob[_META]:
+        ob[_META][slot] = {}
+    ob[_META][slot][key] = value
+
+def _del_layer_meta(mod, key):
+    entry = mod.id_data.get(_META, {}).get(_meta_slot(mod))
+    if entry is not None and key in entry:
+        del entry[key]
+
+def _clear_layer_meta(mod):
+    """Forget a layer's data. Needed on removal and creation too: a new
+    layer named like a removed one gets the same uid and must not inherit
+    its preset or bone flag."""
+    store = mod.id_data.get(_META)
+    if store is not None and _meta_slot(mod) in store:
+        del store[_meta_slot(mod)]
 
 
 # ---------------------------------------------------------------------------
@@ -1266,9 +1387,9 @@ def _stamp_collider(ob):
         mod.node_group = ng
         mod.show_expanded = False
     ident = _input_ident_map(mod.node_group)['Settings']
-    old = mod.get(ident)
+    old = _get_input(mod, ident)
     if old is None or any(abs(a - b) > 1e-6 for a, b in zip(old, vec)):
-        mod[ident] = vec
+        _put_input(mod, ident, vec)
         ob.update_tag()
     if not mod.show_viewport:
         mod.show_viewport = True
@@ -1330,8 +1451,8 @@ def _sync_colliders(scene, force=False):
     for ob in scene.objects:
         for mod in _jiggle_modifiers(ob):
             ident = _input_ident_map(mod.node_group).get('Collider Collection')
-            if ident and mod.get(ident) is not col:
-                mod[ident] = col
+            if ident and _get_input(mod, ident) is not col:
+                _put_input(mod, ident, col)
                 ob.update_tag()
     return col, len(desired)
 
@@ -1427,8 +1548,8 @@ def _repair_layers(scene):
         ref = _ensure_ref_empty(ob)
         for mod in mods:
             ident = _input_ident_map(mod.node_group).get("Reference Object")
-            if ident is not None and mod.get(ident) is not ref:
-                mod[ident] = ref
+            if ident is not None and _get_input(mod, ident) is not ref:
+                _put_input(mod, ident, ref)
                 ob.update_tag()
 
 
@@ -1466,37 +1587,108 @@ def _sj_depsgraph_watch(scene, depsgraph=None):
         if not bpy.app.timers.is_registered(_repair_timer):
             bpy.app.timers.register(_repair_timer, first_interval=0.0)
 
-def _apply_preset(mod, ng, preset_key):
+def _is_bone_layer(mod):
+    # the helper flag also covers older files: their sj_bone key lived on
+    # the modifier, and Blender drops such keys when a file loads
+    return bool(_layer_meta(mod, 'sj_bone')
+                or mod.id_data.get("sj_bone_helper"))
+
+def _preset_layer_values(preset_key, bone=False):
     values = dict(PRESETS[preset_key][1])
-    if mod.get('sj_bone'):
+    if bone:
         # A bone tip has no surface: make the spring isotropic at the
         # preset's normal-mode stiffness, so the bone swings at exactly the
         # preset's frequency in every direction. Folds need a surface.
         values['Stiffness'] *= max(1.0 - values['Normal Softness'], 0.02)
         values['Normal Softness'] = 0.0
         values['Fold Smoothing'] = 0.0
+    return values
+
+def _apply_preset(mod, ng, preset_key):
+    values = _preset_layer_values(preset_key, _is_bone_layer(mod))
     for name, value in values.items():
         _set_value(mod, ng, name, value)
-    mod['sj_body_preset'] = preset_key
-    mod['sj_contact_style'] = 'BODY'
+    _set_layer_meta(mod, 'sj_body_preset', preset_key)
+    _set_layer_meta(mod, 'sj_contact_style', 'BODY')
 
 
-def _apply_contact_style(mod, preset_key, style):
-    """Apply per-layer collision response while preserving body physics."""
-    base = _CONTACT_PRESET_BASE.get(preset_key, _CONTACT_PRESET_BASE['SOFT_SKIN'])
-    gap, friction, squash, bounce, spread = base
+def _contact_values(preset_key, style):
+    """Collision response of a contact style on top of a body preset."""
+    gap, friction, squash, bounce, spread = _CONTACT_PRESET_BASE[preset_key]
     if style == 'HAND':
         gap, friction, squash, bounce, spread = gap * .8, min(friction * 1.2, 1.0), squash * 1.25, bounce * .4, min(spread + 1, 16)
     elif style == 'GRIP':
         gap, friction, squash, bounce, spread = gap * .65, min(friction * 1.65, 1.0), squash * 1.6, 0.0, min(spread + 1, 16)
     elif style == 'STYLIZED':
         gap, friction, squash, bounce, spread = max(gap, .003), min(friction * .8, 1.0), max(squash * 2.2, .8), .35, min(spread + 2, 16)
-    for name, value in (('Collision Distance', gap),
-                        ('Collision Friction', friction),
-                        ('Squash Amount', squash), ('Bounce', bounce),
-                        ('Squash Spread', spread)):
+    return {'Collision Distance': gap, 'Collision Friction': friction,
+            'Squash Amount': squash, 'Bounce': bounce,
+            'Squash Spread': spread}
+
+def _apply_contact_style(mod, preset_key, style):
+    """Apply per-layer collision response while preserving body physics."""
+    for name, value in _contact_values(preset_key, style).items():
         _set_value(mod, mod.node_group, name, value)
-    mod['sj_contact_style'] = style
+    _set_layer_meta(mod, 'sj_contact_style', style)
+
+def _expected_layers():
+    """Socket values each preset x contact style x bone variant leaves on a
+    layer, as the sockets store them (ints truncated like _set_value, floats
+    rounded to float32). Socket values survive file loads where the layer's
+    own keys did not, so its labels can be recognised from them."""
+    kinds = {name: kind for name, kind, *_ in _SOCKET_DEFS}
+
+    def stored(name, value):
+        if kinds.get(name) == 'NodeSocketInt':
+            return int(value)
+        return struct.unpack('f', struct.pack('f', value))[0]
+
+    table = {}
+    for key in PRESETS:
+        for bone in (False, True):
+            for style, _label, _tip in _CONTACT_STYLES:
+                values = _preset_layer_values(key, bone)
+                values.update(_contact_values(key, style))
+                table[key, style, bone] = {name: stored(name, v)
+                                           for name, v in values.items()}
+    return table
+
+_LAYER_TABLE = _expected_layers()
+# The preset alone sets these; a contact style rewrites the other five.
+# Strength, Gravity and Fold Iterations are equal in every preset, so they
+# say nothing about which one it is (and lowering Strength is common).
+_PRESET_FIELDS = ('Damping', 'Fold Smoothing', 'Mass', 'Max Stretch',
+                  'Normal Softness', 'Stiffness', 'Substeps')
+_CONTACT_FIELDS = tuple(_contact_values('SOFT_SKIN', 'BODY'))
+
+def _same_value(a, b):
+    # float32 sockets on 5.2, doubles on 4.x
+    return a is not None and math.isclose(a, b, rel_tol=1e-5, abs_tol=1e-9)
+
+def _best_match(values, rows, fields, least):
+    """Key of the row matching the most fields exactly: unique, and at
+    least `least` of them. An edited field only ever costs its own row a
+    match, so a different row cannot win unless an edit lands exactly on
+    that row's value; a tie gives None rather than a guess."""
+    scores = sorted(((sum(_same_value(values.get(n), row[n]) for n in fields),
+                      key) for key, row in rows), reverse=True)
+    (best, key), (second, _) = scores[0], scores[1]
+    return key if best >= least and best > second else None
+
+def _decode_preset(values, bone=False):
+    """Preset a layer's socket values come from, or None. Every two presets
+    differ in at least 2 of their 7 fields, so any one field may be edited
+    by any amount; at least 5 must still match."""
+    return _best_match(values, ((key, _LAYER_TABLE[key, 'BODY', bone])
+                                for key in PRESETS), _PRESET_FIELDS, 5)
+
+def _decode_contact(values, preset_key, bone=False):
+    """Contact style on top of the given preset, or None. Within a preset
+    the styles differ in at least 4 of their 5 fields; 3 must match."""
+    return _best_match(values, ((style, _LAYER_TABLE[preset_key, style, bone])
+                                for style, _label, _tip in _CONTACT_STYLES),
+                       _CONTACT_FIELDS, 3)
+
 
 def _jiggle_modifiers(obj):
     return [m for m in obj.modifiers
@@ -1515,8 +1707,10 @@ def _create_layer(context, obj, group, preset, bone=False):
     ng = _build_core_group()
     mod = obj.modifiers.new(name=f"SkinJiggle_{group}", type='NODES')
     mod.node_group = ng
+    _clear_layer_meta(mod)
     if bone:
-        mod['sj_bone'] = True     # before the preset: it converts for bones
+        # before the preset: it converts for bones
+        _set_layer_meta(mod, 'sj_bone', True)
     _set_vertex_group(mod, ng, group)
     _apply_preset(mod, ng, preset)
     _set_object(mod, ng, "Reference Object", _ensure_ref_empty(obj))
@@ -1744,6 +1938,7 @@ class SJ_OT_remove_layer(Operator):
         mod = obj.modifiers.get(self.modifier_name)
         if mod:
             _delete_layer_cage(mod)
+            _clear_layer_meta(mod)
             obj.modifiers.remove(mod)
             if not _jiggle_modifiers(obj):
                 _cleanup_ref_empty(obj)
@@ -1799,8 +1994,9 @@ class SJ_OT_apply_preset(Operator):
 
     def invoke(self, context, event):
         _obj, mod = _target_layer(context, self.object_name, self.modifier_name)
-        if mod is not None and mod.get('sj_body_preset') in PRESETS:
-            self.preset = mod['sj_body_preset']   # open on the current one
+        preset = _layer_labels(mod)[0] if mod and mod.node_group else None
+        if preset is not None:
+            self.preset = preset   # open on the current one
         return context.window_manager.invoke_props_dialog(self)
 
     def execute(self, context):
@@ -1820,20 +2016,43 @@ class SJ_OT_contact_style(Operator):
     modifier_name: StringProperty()
     object_name: StringProperty(options={'HIDDEN'})
     style: EnumProperty(name='Style', items=_CONTACT_STYLES, default='BODY')
+    # Asked for only when the layer's preset cannot be told, so a layer with
+    # many edits does not have to lose them to a preset first
+    preset: EnumProperty(name='Defaults of', items=_PRESET_ENUM,
+                         default='SOFT_SKIN')
+    pick_preset: BoolProperty(options={'HIDDEN', 'SKIP_SAVE'})
 
     def invoke(self, context, event):
         _obj, mod = _target_layer(context, self.object_name, self.modifier_name)
-        if mod is not None:
+        if mod is not None and mod.node_group:
             self.modifier_name = mod.name
-            self.style = mod.get('sj_contact_style', 'BODY')
+            preset, style, _n, _m = _layer_labels(mod)
+            self.style = style or 'BODY'
+            self.pick_preset = preset is None
         return context.window_manager.invoke_props_dialog(self, width=340)
+
+    def draw(self, context):
+        self.layout.prop(self, 'style')
+        if self.pick_preset:
+            self.layout.label(text="Preset unknown: scale the contact of",
+                              icon='INFO')
+            self.layout.prop(self, 'preset')
 
     def execute(self, context):
         obj, mod = _target_layer(context, self.object_name, self.modifier_name)
         if mod is None or not mod.node_group:
             self.report({'ERROR'}, 'Jiggle layer not found')
             return {'CANCELLED'}
-        key = mod.get('sj_body_preset', 'SOFT_SKIN')
+        # A style scales its preset's contact defaults. Files from earlier
+        # versions lost the stored preset; never assume Soft Skin's instead.
+        key = _layer_labels(mod)[0]
+        if key is None and self.pick_preset:
+            key = self.preset
+        if key is None:
+            self.report({'ERROR'}, 'Cannot tell which preset this layer uses; '
+                                  'apply a preset first')
+            return {'CANCELLED'}
+        _set_layer_meta(mod, 'sj_body_preset', key)
         _apply_contact_style(mod, key, self.style)
         _refresh(mod.id_data)
         self.report({'INFO'}, f'{self.style.title()} contact applied; adjust the layer values at any time')
@@ -1899,7 +2118,7 @@ def _cage_source(obj):
 
 
 def _layer_cage(mod):
-    name = mod.get("sj_cage", "")
+    name = _layer_meta(mod, "sj_cage", "")
     cage = bpy.data.objects.get(name) if name else None
     if cage is None:
         return None
@@ -1918,8 +2137,7 @@ def _delete_layer_cage(mod):
         bpy.data.objects.remove(cage, do_unlink=True)
         if data.users == 0:
             bpy.data.meshes.remove(data)
-    if "sj_cage" in mod.keys():
-        del mod["sj_cage"]
+    _del_layer_meta(mod, "sj_cage")
 
 
 def _sync_layer_params(src_obj, dst_obj):
@@ -1930,14 +2148,12 @@ def _sync_layer_params(src_obj, dst_obj):
         dm = dst_obj.modifiers.get(m.name)
         if dm is None or dm.type != 'NODES':
             continue
-        for k in m.keys():
-            # each object keeps its own cage link and bake-folder ownership
-            if k in {"sj_cage", "sj_bake_owner"}:
-                continue
-            try:
-                dm[k] = m[k]
-            except (TypeError, KeyError):
-                pass
+        _copy_inputs(m, dm)
+        # each object keeps its own cage link and bake-folder ownership
+        for k in _META_KEYS:
+            value = _layer_meta(m, k)
+            if value is not None and k not in {"sj_cage", "sj_bake_owner"}:
+                _set_layer_meta(dm, k, value)
         n += 1
     dst_obj.update_tag()
     return n
@@ -1968,7 +2184,7 @@ def _create_layer_cage(context, obj, mod, ratio):
     by a copy of that single jiggle layer."""
     ng = mod.node_group
     ident = _input_ident_map(ng).get("Weight")
-    vg_name = mod.get(f"{ident}_attribute_name", "") if ident else ""
+    vg_name = _input_attribute(mod, ident) if ident else ""
     vg = obj.vertex_groups.get(vg_name)
     if vg is None:
         return None, "Layer has no valid vertex group"
@@ -2024,7 +2240,7 @@ def _create_layer_cage(context, obj, mod, ratio):
         # region mesh — still far cheaper than the old design.
         pass
 
-    mod["sj_cage"] = cage.name
+    _set_layer_meta(mod, "sj_cage", cage.name)
     cage["sj_cage_src"] = obj.name
     cage['sj_cage_owner'] = obj
     cage["sj_cage_mod"] = mod.name
@@ -2160,9 +2376,9 @@ class SJ_OT_upgrade_layers(Operator):
                 mods.extend(_old_layers(cage))
         for mod in mods:
             old_map = _input_ident_map(mod.node_group)
-            vals = {name: mod.get(ident) for name, ident in old_map.items()}
+            vals = {name: _get_input(mod, ident) for name, ident in old_map.items()}
             w = old_map.get("Weight")
-            vg_name = mod.get(f"{w}_attribute_name", "") if w else ""
+            vg_name = _input_attribute(mod, w) if w else ""
             mod.node_group = ng
             for name, v in vals.items():
                 if name in {"Geometry", "Weight"} or v is None:
@@ -2215,11 +2431,11 @@ class SJ_OT_reset_defaults(Operator):
                     continue
                 try:
                     if isinstance(default, bool):
-                        mod[item.identifier] = bool(default)
+                        _put_input(mod, item.identifier, bool(default))
                     elif isinstance(default, int):
-                        mod[item.identifier] = int(default)
+                        _put_input(mod, item.identifier, int(default))
                     else:
-                        mod[item.identifier] = float(default)
+                        _put_input(mod, item.identifier, float(default))
                 except (TypeError, KeyError):
                     pass
             # factory = Soft Skin: also resets the preset and contact labels
@@ -2269,7 +2485,7 @@ def _ensure_bake_dirs(objects):
         return os.path.normcase(os.path.realpath(bpy.path.abspath(path)))
 
     def owns(mod):
-        return mod.get('sj_bake_owner') == mod.id_data.name
+        return _layer_meta(mod, 'sj_bake_owner') == mod.id_data.name
 
     holders = {}
     for ob in bpy.data.objects:
@@ -2292,7 +2508,7 @@ def _ensure_bake_dirs(objects):
                 mod.bake_directory = path
                 holders.setdefault(path_key(path), []).append(mod)
             # stamped at once, so a later target sharing the folder moves
-            mod['sj_bake_owner'] = ob.name
+            _set_layer_meta(mod, 'sj_bake_owner', ob.name)
 
 
 def _run_cache_operator(context, operator):
@@ -2508,10 +2724,10 @@ class SJ_OT_bone_stretch(Operator):
 # ===========================================================================
 #  UI
 # ===========================================================================
-def _layer_group(mod):
+def _layer_group(mod, ident_map=None):
     """Name of the vertex group driving a layer ('' if none)."""
-    ident = _input_ident_map(mod.node_group).get("Weight")
-    return mod.get(f"{ident}_attribute_name", "") if ident else ""
+    ident = (ident_map or _input_ident_map(mod.node_group)).get("Weight")
+    return _input_attribute(mod, ident) if ident else ""
 
 
 def _active_layer(obj):
@@ -2523,10 +2739,14 @@ def _active_layer(obj):
     return mods[0] if mods else None
 
 
-def _feel_summary(mod):
-    """Plain-language read-out of a layer's spring: feel, Hz and travel."""
-    v = {name: mod.get(ident)
-         for name, ident in _input_ident_map(mod.node_group).items()}
+def _layer_values(mod, ident_map=None):
+    ident_map = ident_map or _input_ident_map(mod.node_group)
+    return {name: _get_input(mod, ident) for name, ident in ident_map.items()}
+
+
+def _feel_summary(v):
+    """Plain-language read-out of a layer's spring (its _layer_values):
+    feel, Hz, settle time and travel."""
     try:
         k_n = v["Stiffness"] * max(1.0 - v["Normal Softness"], 0.02)
         omega = math.sqrt(k_n / max(v["Mass"], 1e-4))
@@ -2536,12 +2756,64 @@ def _feel_summary(mod):
         return None
     feel = ("Very bouncy" if zeta < 0.25 else "Bouncy" if zeta < 0.45
             else "Soft" if zeta < 0.7 else "Firm, settles fast")
+    # Damping decays velocity, so a swing shrinks at Damping / 2 (zeta *
+    # omega); overdamped, the slow creep back sets the pace. Settled is
+    # under 5 % of the first swing.
+    rate = (zeta * omega if zeta < 1.0
+            else omega * (zeta - math.sqrt(zeta * zeta - 1.0)))
+    settle = math.log(20.0) / rate if rate > 0 else None
     return (f"{feel}, {omega / (2 * math.pi):.1f} Hz",
+            f"Settles in about {settle:.{2 if settle < 1 else 1}f} s"
+            if settle is not None
+            else "Does not settle (no stiffness)",
             f"Jiggle travel up to {travel:.1f} cm")
 
 
-def _preset_label(mod):
-    return PRESETS.get(mod.get('sj_body_preset', ''), ("Custom",))[0]
+def _layer_labels(mod, values=None):
+    """(preset, contact style, preset fields edited, contact fields edited).
+    The labels stored when they were applied win; values decoded from the
+    sockets fill the gaps (files from earlier versions lost the stored
+    ones). Edits count against what the preset and style wrote, except
+    Strength, which the layer list shows on its own."""
+    values = values or _layer_values(mod)
+    bone = _is_bone_layer(mod)
+    preset = _layer_meta(mod, 'sj_body_preset')
+    if preset not in PRESETS:
+        preset = _decode_preset(values, bone)
+    if preset is None:
+        return None, None, 0, 0
+    style = _layer_meta(mod, 'sj_contact_style')
+    if style not in {ident for ident, _label, _tip in _CONTACT_STYLES}:
+        style = _decode_contact(values, preset, bone)
+    row = _LAYER_TABLE[preset, style or 'BODY', bone]
+
+    def edits(fields):
+        return sum(not _same_value(values.get(n), row[n]) for n in fields)
+    return (preset, style,
+            edits(_PRESET_FIELDS + ('Gravity', 'Fold Iterations')),
+            edits(_CONTACT_FIELDS) if style else 0)
+
+
+def _label_texts(mod, values=None):
+    """Preset and contact button texts: 'Chest — D cup +2' when two of the
+    values it wrote were changed since, 'Custom' when it is unknown."""
+    preset, style, n_preset, n_contact = _layer_labels(mod, values)
+
+    def text(label, n):
+        return f"{label} +{n}" if n else label
+    contact = next((label for ident, label, _tip in _CONTACT_STYLES
+                    if ident == style), None)
+    return (text(PRESETS[preset][0], n_preset) if preset else "Custom",
+            text(contact, n_contact) if contact else "Custom")
+
+
+def _strength_chip(strength):
+    """Layer list text for a changed Strength ('' when it is 100 %)."""
+    if _same_value(strength, 1.0):
+        return ""
+    # never round a changed Strength to the 100 % it is not
+    pct = round(strength * 100)
+    return f"{min(pct, 99) if strength < 1 else max(pct, 101)}%"
 
 
 class SJ_UL_layers(bpy.types.UIList):
@@ -2556,7 +2828,8 @@ class SJ_UL_layers(bpy.types.UIList):
 
     def draw_item(self, context, layout, data, item, icon, active_data,
                   active_propname, index):
-        group = _layer_group(item)
+        ident_map = _input_ident_map(item.node_group)
+        group = _layer_group(item, ident_map)
         missing = group not in data.vertex_groups
         row = layout.row(align=True)
         name = row.row(align=True)
@@ -2566,6 +2839,12 @@ class SJ_UL_layers(bpy.types.UIList):
         cage = _layer_cage(item)
         if cage is not None and not cage.hide_viewport:
             row.label(text="", icon='MESH_ICOSPHERE')
+        # a lowered Strength is a common edit; the preset label ignores it
+        ident = ident_map.get("Blend")
+        strength = _get_input(item, ident) if ident else None
+        chip = _strength_chip(strength) if strength is not None else ""
+        if chip:
+            row.label(text=chip)
         row.prop(item, "show_viewport", text="", emboss=False)
 
 
@@ -2580,7 +2859,43 @@ class _SJPanel:
                 and context.object.type in {'MESH', 'ARMATURE'})
 
 
+def _physics_conflicts(ob, scene):
+    """Blender simulations that take over a jiggled object or collider after
+    the start frame, as (title, hint). Moves made on later frames look
+    undone, which reads as the add-on resetting the object. A Passive or
+    Animated rigid body follows the object, so it is no conflict."""
+    found = []
+    rb, world = ob.rigid_body, scene.rigidbody_world
+    if (rb is not None and rb.enabled and rb.type == 'ACTIVE'
+            and not rb.kinematic and world is not None and world.enabled
+            and world.collection is not None
+            and ob.name in world.collection.objects):
+        found.append((f"Rigid Body moves it after frame {scene.frame_start}",
+                      "Move it on that frame, tick Animated in Rigid Body, "
+                      "or remove it: Collision alone pushes skin"))
+    if any(m.type == 'SOFT_BODY' and m.show_viewport for m in ob.modifiers):
+        found.append((f"Soft Body reshapes it after frame {scene.frame_start}",
+                      "It fights the jiggle layers; remove it in Physics "
+                      "unless you need both"))
+    return found
+
+
+def _draw_physics_conflicts(layout, ob, scene, hints=True):
+    for title, hint in _physics_conflicts(ob, scene):
+        box = layout.box() if hints else layout
+        col = box.column(align=True)
+        col.alert = True
+        col.label(text=title, icon='ERROR')
+        if hints:
+            col.scale_y = 0.85
+            # short lines: the sidebar clips labels at its default width
+            for line in textwrap.wrap(hint, 30):
+                col.label(text=line, icon='BLANK1')
+
+
 def _draw_warnings(layout, context, obj):
+    if obj.type == 'MESH' and (_jiggle_modifiers(obj) or _is_collider(obj)):
+        _draw_physics_conflicts(layout, obj, context.scene)
     if abs(context.scene.unit_settings.scale_length - 1.0) > 1e-6:
         warning = layout.box()
         warning.alert = True
@@ -2693,7 +3008,7 @@ def _draw_layer_settings(layout, obj, mod, pb=None):
         return split
 
     if pb is None:
-        group = _layer_group(mod)
+        group = _layer_group(mod, ident_map)
         missing = group not in obj.vertex_groups
         row = labelled("Group")
         row.alert = missing
@@ -2705,31 +3020,30 @@ def _draw_layer_settings(layout, obj, mod, pb=None):
     else:
         row = labelled("Bone")
         row.label(text=pb.name, icon='BONE_DATA')
+    values = _layer_values(mod, ident_map)
+    preset_text, contact_text = _label_texts(mod, values)
     row = labelled("Preset")
-    op = row.operator("skin_jiggle.apply_preset",
-                      text=_preset_label(mod), icon='PRESET')
+    op = row.operator("skin_jiggle.apply_preset", text=preset_text, icon='PRESET')
     op.modifier_name = mod.name
     op.object_name = owner
     row = labelled("Contact")
-    style = mod.get('sj_contact_style', 'BODY')
-    op = row.operator('skin_jiggle.contact_style',
-                      text=next((label for ident, label, _ in _CONTACT_STYLES
-                                 if ident == style), 'Body preset'),
+    op = row.operator('skin_jiggle.contact_style', text=contact_text,
                       icon='PHYSICS')
     op.modifier_name = mod.name
     op.object_name = owner
 
     ident = ident_map.get("Blend")
     if ident:
-        layout.prop(mod, f'["{ident}"]', text="Strength", slider=True)
+        _draw_input(layout, mod, ident, text="Strength", slider=True)
 
-    summary = _feel_summary(mod)
+    summary = _feel_summary(values)
     if summary:
         col = layout.column(align=True)
         col.scale_y = 0.85
         col.label(text=summary[0], icon='FORCE_HARMONIC')
-        col.label(text=summary[1] if pb is None
-                  else summary[1].replace("Jiggle travel", "Tip swing"),
+        col.label(text=summary[1], icon='TIME')
+        col.label(text=summary[2] if pb is None
+                  else summary[2].replace("Jiggle travel", "Tip swing"),
                   icon='BLANK1')
 
     row = layout.row(align=True)
@@ -2756,7 +3070,7 @@ def _draw_layer_settings(layout, obj, mod, pb=None):
             col = layout.column(align=True)
             ident = ident_map.get("Stretch Amount")
             if ident is not None:
-                col.prop(mod, f'["{ident}"]', text="Stretch Amount")
+                _draw_input(col, mod, ident, text="Stretch Amount")
             col.prop(con, "bulge", text="Volume")
             tip = layout.column(align=True)
             tip.scale_y = 0.8
@@ -2780,7 +3094,7 @@ def _draw_layer_settings(layout, obj, mod, pb=None):
                 continue    # bone tips are isotropic
             ident = ident_map.get(name)
             if ident is not None:
-                col.prop(mod, f'["{ident}"]', text=name)
+                _draw_input(col, mod, ident, text=name)
         if sid == "limits":
             tip = body.column(align=True)
             tip.scale_y = 0.8
@@ -2846,6 +3160,7 @@ class VIEW3D_PT_skin_jiggle_colliders(_SJPanel, Panel):
             box.prop(collider, 'name', text='', emboss=False,
                      icon='VIEW_PAN' if collider.get('sj_managed_collider')
                      else 'MESH_DATA')
+            _draw_physics_conflicts(box, collider, context.scene, hints=False)
             col = box.column(align=True)
             col.use_property_split = True
             col.use_property_decorate = False
