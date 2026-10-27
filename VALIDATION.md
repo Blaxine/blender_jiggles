@@ -12,7 +12,7 @@ blender --background --factory-startup --python-exit-code 1 --python tests/check
 blender --background --factory-startup --python-exit-code 1 --python tests/collision_sweep.py
 ```
 
-`tests/check_bones.py` (19 checks, all passing on 4.5.4 and 5.2.2) covers
+`tests/check_bones.py` (20 checks, all passing on 4.5.4 and 5.2.2) covers
 jiggle bones: adding them in Pose Mode, helper parenting, all 29 presets
 converting to isotropic bone springs, contact style and Squash & Stretch
 toggles, a two-bone chain, swing frequency (Jelly: 2.99 Hz measured vs 3.00
@@ -43,6 +43,16 @@ The regression script checks:
   values (closest pair: 17.2 % apart in Collision Friction), and the values
   applying them writes match the table exactly, so a layer's labels could be
   recognised from its socket values alone.
+- Labels decode from socket values: the preset by which one matches the most
+  of the 7 fields only a preset sets (unique, at least 5; every two presets
+  differ in at least 2), the contact style likewise from its 5 fields (at
+  least 3; styles differ in at least 4). Every combination decodes to itself;
+  any one field edited by any amount still decodes correctly; with two edits
+  the decode gave up 24 of 2436 times and never named a different preset.
+- A layer without stored labels (a file from an earlier version) shows them
+  from its values, counts edits as "+N" but not a lowered Strength, and
+  Contact Style uses its own preset's contact defaults instead of Soft Skin's.
+  When the preset cannot be told, Contact Style refuses.
 - All 29 presets (25 body, 4 material) match their declared frequency and
   damping ratio, stay
   within every exposed parameter range, and avoid the stiffness stability

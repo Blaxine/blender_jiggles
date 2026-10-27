@@ -1634,6 +1634,42 @@ def _expected_layers():
                                            for name, v in values.items()}
     return table
 
+_LAYER_TABLE = _expected_layers()
+# The preset alone sets these; a contact style rewrites the other five.
+# Strength, Gravity and Fold Iterations are equal in every preset, so they
+# say nothing about which one it is (and lowering Strength is common).
+_PRESET_FIELDS = ('Damping', 'Fold Smoothing', 'Mass', 'Max Stretch',
+                  'Normal Softness', 'Stiffness', 'Substeps')
+_CONTACT_FIELDS = tuple(_contact_values('SOFT_SKIN', 'BODY'))
+
+def _same_value(a, b):
+    # float32 sockets on 5.2, doubles on 4.x
+    return a is not None and math.isclose(a, b, rel_tol=1e-5, abs_tol=1e-9)
+
+def _best_match(values, rows, fields, least):
+    """Key of the row matching the most fields exactly: unique, and at
+    least `least` of them. An edited field only ever costs its own row a
+    match, so a different row cannot win unless an edit lands exactly on
+    that row's value; a tie gives None rather than a guess."""
+    scores = sorted(((sum(_same_value(values.get(n), row[n]) for n in fields),
+                      key) for key, row in rows), reverse=True)
+    (best, key), (second, _) = scores[0], scores[1]
+    return key if best >= least and best > second else None
+
+def _decode_preset(values, bone=False):
+    """Preset a layer's socket values come from, or None. Every two presets
+    differ in at least 2 of their 7 fields, so any one field may be edited
+    by any amount; at least 5 must still match."""
+    return _best_match(values, ((key, _LAYER_TABLE[key, 'BODY', bone])
+                                for key in PRESETS), _PRESET_FIELDS, 5)
+
+def _decode_contact(values, preset_key, bone=False):
+    """Contact style on top of the given preset, or None. Within a preset
+    the styles differ in at least 4 of their 5 fields; 3 must match."""
+    return _best_match(values, ((style, _LAYER_TABLE[preset_key, style, bone])
+                                for style, _label, _tip in _CONTACT_STYLES),
+                       _CONTACT_FIELDS, 3)
+
 
 def _jiggle_modifiers(obj):
     return [m for m in obj.modifiers
@@ -1939,8 +1975,9 @@ class SJ_OT_apply_preset(Operator):
 
     def invoke(self, context, event):
         _obj, mod = _target_layer(context, self.object_name, self.modifier_name)
-        if mod is not None and _layer_meta(mod, 'sj_body_preset') in PRESETS:
-            self.preset = _layer_meta(mod, 'sj_body_preset')   # open on the current one
+        preset = _layer_labels(mod)[0] if mod and mod.node_group else None
+        if preset is not None:
+            self.preset = preset   # open on the current one
         return context.window_manager.invoke_props_dialog(self)
 
     def execute(self, context):
@@ -1963,9 +2000,9 @@ class SJ_OT_contact_style(Operator):
 
     def invoke(self, context, event):
         _obj, mod = _target_layer(context, self.object_name, self.modifier_name)
-        if mod is not None:
+        if mod is not None and mod.node_group:
             self.modifier_name = mod.name
-            self.style = _layer_meta(mod, 'sj_contact_style', 'BODY')
+            self.style = _layer_labels(mod)[1] or 'BODY'
         return context.window_manager.invoke_props_dialog(self, width=340)
 
     def execute(self, context):
@@ -1973,7 +2010,14 @@ class SJ_OT_contact_style(Operator):
         if mod is None or not mod.node_group:
             self.report({'ERROR'}, 'Jiggle layer not found')
             return {'CANCELLED'}
-        key = _layer_meta(mod, 'sj_body_preset', 'SOFT_SKIN')
+        # A style scales its preset's contact defaults. Files from earlier
+        # versions lost the stored preset; never assume Soft Skin's instead.
+        key = _layer_labels(mod)[0]
+        if key is None:
+            self.report({'ERROR'}, 'Cannot tell which preset this layer uses; '
+                                  'apply a preset first')
+            return {'CANCELLED'}
+        _set_layer_meta(mod, 'sj_body_preset', key)
         _apply_contact_style(mod, key, self.style)
         _refresh(mod.id_data)
         self.report({'INFO'}, f'{self.style.title()} contact applied; adjust the layer values at any time')
@@ -2677,8 +2721,51 @@ def _feel_summary(mod):
             f"Jiggle travel up to {travel:.1f} cm")
 
 
+def _layer_values(mod):
+    return {name: _get_input(mod, ident)
+            for name, ident in _input_ident_map(mod.node_group).items()}
+
+
+def _layer_labels(mod):
+    """(preset, contact style, preset fields edited, contact fields edited).
+    The labels stored when they were applied win; values decoded from the
+    sockets fill the gaps (files from earlier versions lost the stored
+    ones). Edits count against what the preset and style wrote, except
+    Strength, which the layer list shows on its own."""
+    values = _layer_values(mod)
+    bone = _is_bone_layer(mod)
+    preset = _layer_meta(mod, 'sj_body_preset')
+    if preset not in PRESETS:
+        preset = _decode_preset(values, bone)
+    if preset is None:
+        return None, None, 0, 0
+    style = _layer_meta(mod, 'sj_contact_style')
+    if style not in {ident for ident, _label, _tip in _CONTACT_STYLES}:
+        style = _decode_contact(values, preset, bone)
+    row = _LAYER_TABLE[preset, style or 'BODY', bone]
+
+    def edits(fields):
+        return sum(not _same_value(values.get(n), row[n]) for n in fields)
+    return (preset, style,
+            edits(_PRESET_FIELDS + ('Gravity', 'Fold Iterations')),
+            edits(_CONTACT_FIELDS) if style else 0)
+
+
+def _label_texts(mod):
+    """Preset and contact button texts: 'Chest — D cup +2' when two of the
+    values it wrote were changed since, 'Custom' when it is unknown."""
+    preset, style, n_preset, n_contact = _layer_labels(mod)
+
+    def text(label, n):
+        return f"{label} +{n}" if n else label
+    contact = next((label for ident, label, _tip in _CONTACT_STYLES
+                    if ident == style), None)
+    return (text(PRESETS[preset][0], n_preset) if preset else "Custom",
+            text(contact, n_contact) if contact else "Custom")
+
+
 def _preset_label(mod):
-    return PRESETS.get(_layer_meta(mod, 'sj_body_preset', ''), ("Custom",))[0]
+    return _label_texts(mod)[0]
 
 
 class SJ_UL_layers(bpy.types.UIList):
@@ -2703,6 +2790,11 @@ class SJ_UL_layers(bpy.types.UIList):
         cage = _layer_cage(item)
         if cage is not None and not cage.hide_viewport:
             row.label(text="", icon='MESH_ICOSPHERE')
+        # a lowered Strength is a common edit; the preset label ignores it
+        ident = _input_ident_map(item.node_group).get("Blend")
+        strength = _get_input(item, ident) if ident else None
+        if strength is not None and not _same_value(strength, 1.0):
+            row.label(text=f"{strength:.0%}")
         row.prop(item, "show_viewport", text="", emboss=False)
 
 
@@ -2842,16 +2934,13 @@ def _draw_layer_settings(layout, obj, mod, pb=None):
     else:
         row = labelled("Bone")
         row.label(text=pb.name, icon='BONE_DATA')
+    preset_text, contact_text = _label_texts(mod)
     row = labelled("Preset")
-    op = row.operator("skin_jiggle.apply_preset",
-                      text=_preset_label(mod), icon='PRESET')
+    op = row.operator("skin_jiggle.apply_preset", text=preset_text, icon='PRESET')
     op.modifier_name = mod.name
     op.object_name = owner
     row = labelled("Contact")
-    style = _layer_meta(mod, 'sj_contact_style', 'BODY')
-    op = row.operator('skin_jiggle.contact_style',
-                      text=next((label for ident, label, _ in _CONTACT_STYLES
-                                 if ident == style), 'Body preset'),
+    op = row.operator('skin_jiggle.contact_style', text=contact_text,
                       icon='PHYSICS')
     op.modifier_name = mod.name
     op.object_name = owner

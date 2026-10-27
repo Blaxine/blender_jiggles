@@ -110,6 +110,9 @@ r = bpy.ops.skin_jiggle.contact_style(modifier_name=mod.name,
                                       object_name=h_br.name, style='GRIP')
 check("contact style targets the bone's helper",
       r == {'FINISHED'} and sjp._layer_meta(mod, 'sj_contact_style') == 'GRIP')
+sjp._clear_layer_meta(mod)
+check("bone layer labels decode from its values without stored ones",
+      sjp._layer_labels(mod)[:2] == (key, 'GRIP'), str(sjp._layer_labels(mod)))
 bpy.ops.skin_jiggle.apply_preset(modifier_name=mod.name, object_name=h_br.name,
                                  preset='JELLY')
 for h in (h_br, h_tip):

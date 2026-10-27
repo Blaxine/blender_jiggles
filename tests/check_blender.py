@@ -52,6 +52,35 @@ margin, field, x, y = min(largest_difference(expected[x], expected[y]) + (x, y)
 print(f'SJ_CHECK: {len(expected)} preset/style/bone combinations distinct; '
       f'closest pair {x} vs {y} differs by {margin:.1%} in {field}', flush=True)
 
+# Decoding a layer's labels from its values: every combination decodes to
+# itself, one edited field of any size still gives its preset and style, and
+# two edits may give up (None) but never name a different one.
+def edited(row, name, factor):
+    out, v = dict(row), row[name]
+    if isinstance(v, int):
+        out[name] = v + (1 if factor > 1 else -1)
+    else:
+        out[name] = v * factor if v else .05 * factor
+    return out
+
+factors = (.5, .93, 1.07, 2.0)
+for (key, style, bone), row in expected.items():
+    assert sj._decode_preset(row, bone) == key, (key, style, bone)
+    assert sj._decode_contact(row, key, bone) == style, (key, style, bone)
+    for name, f in itertools.product(sj._CONTACT_FIELDS, factors):
+        assert sj._decode_contact(edited(row, name, f), key, bone) == style, (key, style, bone, name, f)
+gave_up = 0
+for key, bone in itertools.product(sj.PRESETS, (False, True)):
+    row = expected[key, 'BODY', bone]
+    for name, f in itertools.product(sj._PRESET_FIELDS, factors):
+        assert sj._decode_preset(edited(row, name, f), bone) == key, (key, bone, name, f)
+    for (a, b), f in itertools.product(itertools.combinations(sj._PRESET_FIELDS, 2), (.93, 2.0)):
+        found = sj._decode_preset(edited(edited(row, a, f), b, f), bone)
+        assert found in (key, None), (key, bone, a, b, f, found)
+        gave_up += found is None
+print(f'SJ_CHECK: labels decode with any one field edited; two edits gave up '
+      f'{gave_up} of {len(sj.PRESETS) * 2 * 21 * 2} times, never wrong', flush=True)
+
 print('SJ_CHECK: built', len(ng.nodes), 'nodes;', len(sj.PRESETS), 'presets valid', flush=True)
 
 def mesh_object(name, coords, faces):
@@ -269,6 +298,42 @@ mm, _, _ = sj._create_layer(bpy.context, meta_ob, 'Tissue', 'SOFT_SKIN')
 assert not sj._is_bone_layer(mm) and sj._layer_group(mm) == 'Tissue'
 bpy.data.objects.remove(meta_ob, do_unlink=True)
 print('SJ_CHECK: layer data follows renames and removal', flush=True)
+
+# Labels and Contact Style on a layer whose stored labels are gone (a file
+# saved by an earlier version) come from its values; Strength is no edit.
+lab_ob = mesh_object('Labels', quad, [(0, 1, 2, 3)])
+lm, _, _ = sj._create_layer(bpy.context, lab_ob, 'Tissue', 'CHEST_D')
+sj._apply_contact_style(lm, 'CHEST_D', 'HAND')
+idents = sj._input_ident_map(ng)
+sj._put_input(lm, idents['Blend'], .6)
+chest_d = sj.PRESETS['CHEST_D'][0]
+assert sj._label_texts(lm) == (chest_d, 'Soft hand'), sj._label_texts(lm)
+sj._clear_layer_meta(lm)
+assert sj._layer_labels(lm) == ('CHEST_D', 'HAND', 0, 0), sj._layer_labels(lm)
+stiffness = sj._get_input(lm, idents['Stiffness'])
+sj._put_input(lm, idents['Stiffness'], 2 * stiffness)
+assert sj._label_texts(lm) == (chest_d + ' +1', 'Soft hand'), sj._label_texts(lm)
+bpy.context.view_layer.objects.active = lab_ob
+assert bpy.ops.skin_jiggle.contact_style(modifier_name=lm.name, style='GRIP') == {'FINISHED'}
+assert sj._layer_meta(lm, 'sj_body_preset') == 'CHEST_D'
+# Chest D's contact defaults, not Soft Skin's
+live = {n: sj._get_input(lm, idents[n]) for n in sj._CONTACT_FIELDS}
+want = {n: expected['CHEST_D', 'GRIP', False][n] for n in sj._CONTACT_FIELDS}
+assert same_values(live, want), (live, want)
+assert sj._label_texts(lm) == (chest_d + ' +1', 'Firm grip'), sj._label_texts(lm)
+# Too many edits to tell the preset: refuse instead of guessing.
+sj._clear_layer_meta(lm)
+for name in ('Damping', 'Mass', 'Max Stretch'):
+    sj._put_input(lm, idents[name], 1.3 * sj._get_input(lm, idents[name]))
+assert sj._label_texts(lm) == ('Custom', 'Custom'), sj._label_texts(lm)
+try:
+    result = bpy.ops.skin_jiggle.contact_style(modifier_name=lm.name, style='STYLIZED')
+except RuntimeError:
+    result = {'CANCELLED'}
+assert result == {'CANCELLED'}
+assert {n: sj._get_input(lm, idents[n]) for n in sj._CONTACT_FIELDS} == live
+bpy.data.objects.remove(lab_ob, do_unlink=True)
+print('SJ_CHECK: labels and Contact Style recover the preset from values', flush=True)
 
 # Legacy operator retry must propagate errors to the outer UI handler.
 calls = []
