@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 import sys
 import tempfile
+import types
 
 import bpy
 
@@ -23,6 +24,10 @@ for key, (_, values) in sj.PRESETS.items():
     omega = math.sqrt(kn / values['Mass'])
     assert math.isclose(omega / (2 * math.pi), f)
     assert math.isclose(values['Damping'] / (2 * omega), zeta)
+    # the panel's settle time: the swing exp(-zeta * omega * t) falls to 5 %
+    settle = math.log(20) / (zeta * 2 * math.pi * f)
+    places = 2 if settle < 1 else 1
+    assert sj._feel_summary(values)[1] == f"Settles in about {settle:.{places}f} s", (key, sj._feel_summary(values))
     for name, _, _, lo, hi, _, _ in sj._SOCKET_DEFS:
         if name in values and lo is not None:
             assert lo <= values[name] <= hi, (key, name, values[name])
@@ -33,6 +38,11 @@ for key, (_, values) in sj.PRESETS.items():
     gap, friction, squash, object_bounce, spread = sj._CONTACT_PRESET_BASE[key]
     assert .0005 <= gap <= .003 and 0 <= friction <= 1
     assert 0 <= object_bounce <= 1 and 0 <= spread <= 16 and squash <= 5
+# Overdamped, the slow creep back sets the settle time; no spring, none.
+creep = dict(values, Stiffness=values['Mass'] * 100, **{'Normal Softness': 0, 'Damping': 50})
+assert sj._feel_summary(creep)[1] == f"Settles in about {math.log(20) / (25 - math.sqrt(525)):.1f} s"
+assert sj._feel_summary(dict(values, Stiffness=0))[1] == "Does not settle (no stiffness)"
+assert 'TIME' in bpy.types.UILayout.bl_rna.functions['label'].parameters['icon'].enum_items
 
 # A layer's preset and contact style can only be recognised from its socket
 # values if no two preset x style x bone combinations leave the same values.
@@ -251,6 +261,59 @@ col2, count = sj._sync_colliders(other)
 assert col1 is not col2 and count == 0 and len(col2.objects) == 0
 assert a in list(col1.objects) and b in list(col1.objects)
 print('SJ_CHECK: shared mesh settings and scene isolation pass', flush=True)
+
+# Blender's own simulations take an object over after the start frame, so
+# moves made later look undone; the panel says so. Own scene: a rigid body
+# world here would change every later simulation check.
+phys = bpy.data.scenes.new('Physics')
+phys.frame_start = 5
+probe = bpy.data.objects.new('Probe', bpy.data.meshes.new('Probe'))
+probe.data.from_pydata(quad, [], [(0, 1, 2, 3)])
+phys.collection.objects.link(probe)
+probe.modifiers.new('Collision', 'COLLISION')
+assert sj._physics_conflicts(probe, phys) == []
+with bpy.context.temp_override(scene=phys, object=probe, active_object=probe,
+                               selected_objects=[probe],
+                               selected_editable_objects=[probe]):
+    assert bpy.ops.rigidbody.object_add(type='ACTIVE') == {'FINISHED'}
+titles = [t for t, _hint in sj._physics_conflicts(probe, phys)]
+assert titles == ['Rigid Body moves it after frame 5'], titles
+probe.rigid_body.kinematic = True      # Animated: follows its keyframes
+assert sj._physics_conflicts(probe, phys) == []
+probe.rigid_body.kinematic = False
+probe.rigid_body.type = 'PASSIVE'      # stays where it is put
+assert sj._physics_conflicts(probe, phys) == []
+probe.rigid_body.type = 'ACTIVE'
+probe.modifiers.new('Softbody', 'SOFT_BODY')
+titles = [t for t, _hint in sj._physics_conflicts(probe, phys)]
+assert titles == ['Rigid Body moves it after frame 5',
+                  'Soft Body reshapes it after frame 5'], titles
+
+
+class Recorder:
+    """Stand-in layout that keeps the label texts drawn into it."""
+    def __init__(self, texts):
+        self.texts = texts
+
+    def __getattr__(self, name):
+        def call(*args, **kw):
+            if name == 'label':
+                self.texts.append(kw.get('text'))
+            return Recorder(self.texts)
+        return call
+
+
+drawn = []
+sj._draw_warnings(Recorder(drawn), types.SimpleNamespace(scene=phys), probe)
+assert titles[0] in drawn and titles[1] in drawn, drawn
+assert any('Animated' in t for t in drawn), drawn   # the hint is shown
+assert all(len(t) <= 45 for t in drawn), drawn
+drawn = []
+sj._draw_physics_conflicts(Recorder(drawn), probe, phys, hints=False)
+assert drawn == titles, drawn                       # collider list: titles only
+bpy.data.objects.remove(probe, do_unlink=True)
+bpy.data.scenes.remove(phys)
+print('SJ_CHECK: Rigid Body and Soft Body takeovers are flagged', flush=True)
 
 # Duplicate object must never delete its original's cage.
 bpy.context.view_layer.objects.active = ob

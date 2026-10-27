@@ -50,6 +50,7 @@ import math
 import logging
 import os
 import struct
+import textwrap
 import uuid
 from bpy.types import Operator, Panel
 from bpy.props import BoolProperty, EnumProperty, StringProperty
@@ -2745,7 +2746,7 @@ def _layer_values(mod, ident_map=None):
 
 def _feel_summary(v):
     """Plain-language read-out of a layer's spring (its _layer_values):
-    feel, Hz and travel."""
+    feel, Hz, settle time and travel."""
     try:
         k_n = v["Stiffness"] * max(1.0 - v["Normal Softness"], 0.02)
         omega = math.sqrt(k_n / max(v["Mass"], 1e-4))
@@ -2755,7 +2756,16 @@ def _feel_summary(v):
         return None
     feel = ("Very bouncy" if zeta < 0.25 else "Bouncy" if zeta < 0.45
             else "Soft" if zeta < 0.7 else "Firm, settles fast")
+    # Damping decays velocity, so a swing shrinks at Damping / 2 (zeta *
+    # omega); overdamped, the slow creep back sets the pace. Settled is
+    # under 5 % of the first swing.
+    rate = (zeta * omega if zeta < 1.0
+            else omega * (zeta - math.sqrt(zeta * zeta - 1.0)))
+    settle = math.log(20.0) / rate if rate > 0 else None
     return (f"{feel}, {omega / (2 * math.pi):.1f} Hz",
+            f"Settles in about {settle:.{2 if settle < 1 else 1}f} s"
+            if settle is not None
+            else "Does not settle (no stiffness)",
             f"Jiggle travel up to {travel:.1f} cm")
 
 
@@ -2849,7 +2859,43 @@ class _SJPanel:
                 and context.object.type in {'MESH', 'ARMATURE'})
 
 
+def _physics_conflicts(ob, scene):
+    """Blender simulations that take over a jiggled object or collider after
+    the start frame, as (title, hint). Moves made on later frames look
+    undone, which reads as the add-on resetting the object. A Passive or
+    Animated rigid body follows the object, so it is no conflict."""
+    found = []
+    rb, world = ob.rigid_body, scene.rigidbody_world
+    if (rb is not None and rb.enabled and rb.type == 'ACTIVE'
+            and not rb.kinematic and world is not None and world.enabled
+            and world.collection is not None
+            and ob.name in world.collection.objects):
+        found.append((f"Rigid Body moves it after frame {scene.frame_start}",
+                      "Move it on that frame, tick Animated in Rigid Body, "
+                      "or remove it: Collision alone pushes skin"))
+    if any(m.type == 'SOFT_BODY' and m.show_viewport for m in ob.modifiers):
+        found.append((f"Soft Body reshapes it after frame {scene.frame_start}",
+                      "It fights the jiggle layers; remove it in Physics "
+                      "unless you need both"))
+    return found
+
+
+def _draw_physics_conflicts(layout, ob, scene, hints=True):
+    for title, hint in _physics_conflicts(ob, scene):
+        box = layout.box() if hints else layout
+        col = box.column(align=True)
+        col.alert = True
+        col.label(text=title, icon='ERROR')
+        if hints:
+            col.scale_y = 0.85
+            # short lines: the sidebar clips labels at its default width
+            for line in textwrap.wrap(hint, 30):
+                col.label(text=line, icon='BLANK1')
+
+
 def _draw_warnings(layout, context, obj):
+    if obj.type == 'MESH' and (_jiggle_modifiers(obj) or _is_collider(obj)):
+        _draw_physics_conflicts(layout, obj, context.scene)
     if abs(context.scene.unit_settings.scale_length - 1.0) > 1e-6:
         warning = layout.box()
         warning.alert = True
@@ -2995,8 +3041,9 @@ def _draw_layer_settings(layout, obj, mod, pb=None):
         col = layout.column(align=True)
         col.scale_y = 0.85
         col.label(text=summary[0], icon='FORCE_HARMONIC')
-        col.label(text=summary[1] if pb is None
-                  else summary[1].replace("Jiggle travel", "Tip swing"),
+        col.label(text=summary[1], icon='TIME')
+        col.label(text=summary[2] if pb is None
+                  else summary[2].replace("Jiggle travel", "Tip swing"),
                   icon='BLANK1')
 
     row = layout.row(align=True)
@@ -3113,6 +3160,7 @@ class VIEW3D_PT_skin_jiggle_colliders(_SJPanel, Panel):
             box.prop(collider, 'name', text='', emboss=False,
                      icon='VIEW_PAN' if collider.get('sj_managed_collider')
                      else 'MESH_DATA')
+            _draw_physics_conflicts(box, collider, context.scene, hints=False)
             col = box.column(align=True)
             col.use_property_split = True
             col.use_property_decorate = False

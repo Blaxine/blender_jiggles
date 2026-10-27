@@ -59,7 +59,10 @@ The regression script checks:
 - All 29 presets (25 body, 4 material) match their declared frequency and
   damping ratio, stay
   within every exposed parameter range, and avoid the stiffness stability
-  clamp at 24 fps with their normal-quality substep settings.
+  clamp at 24 fps with their normal-quality substep settings. The layer
+  panel's settle time (until a swing is under 5 % of the first) follows
+  from the same frequency and damping ratio; overdamped springs use their
+  slow creep back, and a spring without stiffness reports none.
 - Actual evaluated simulation advances across frames.
 - Zero-weight vertices remain pinned with smoothing and collision enabled.
 - A floor contact needing 50 mm of travel against a 25 mm Max Stretch is
@@ -69,6 +72,11 @@ The regression script checks:
 - Two collider objects sharing one mesh retain different evaluated thickness
   attributes while the shared source mesh remains unchanged.
 - Collider helper collections are isolated between scenes.
+- A jiggled object or collider that Blender's own simulations take over
+  after the start frame is flagged in the panel: an Active rigid body (it
+  moves the object, so moves made on later frames look undone) and Soft
+  Body (it reshapes the mesh). Passive and Animated rigid bodies follow the
+  object and are not flagged.
 - A duplicate cannot delete its original object's cage; source and layer
   renaming still resolve the cage correctly.
 - A layer's own data (preset, contact style, bone flag) follows a modifier
