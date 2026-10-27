@@ -1,5 +1,6 @@
 """Run with Blender --background --factory-startup --python tests/check_blender.py."""
 import importlib.util
+import itertools
 import math
 from pathlib import Path
 import sys
@@ -32,6 +33,24 @@ for key, (_, values) in sj.PRESETS.items():
     gap, friction, squash, object_bounce, spread = sj._CONTACT_PRESET_BASE[key]
     assert .0005 <= gap <= .003 and 0 <= friction <= 1
     assert 0 <= object_bounce <= 1 and 0 <= spread <= 16 and squash <= 5
+
+# A layer's preset and contact style can only be recognised from its socket
+# values if no two preset x style x bone combinations leave the same values.
+def same_values(a, b):
+    return all(math.isclose(a[n], b[n], rel_tol=1e-5, abs_tol=1e-9) for n in a)
+
+def largest_difference(a, b):
+    return max((abs(a[n] - b[n]) / max(abs(a[n]), abs(b[n]), 1e-12), n) for n in a)
+
+expected = sj._expected_layers()
+assert len(expected) == len(sj.PRESETS) * len(sj._CONTACT_STYLES) * 2
+clashes = [(x, y) for x, y in itertools.combinations(expected, 2)
+           if same_values(expected[x], expected[y])]
+assert not clashes, clashes
+margin, field, x, y = min(largest_difference(expected[x], expected[y]) + (x, y)
+                          for x, y in itertools.combinations(expected, 2))
+print(f'SJ_CHECK: {len(expected)} preset/style/bone combinations distinct; '
+      f'closest pair {x} vs {y} differs by {margin:.1%} in {field}', flush=True)
 
 print('SJ_CHECK: built', len(ng.nodes), 'nodes;', len(sj.PRESETS), 'presets valid', flush=True)
 
@@ -150,6 +169,10 @@ for key, (_, preset_values) in sj.PRESETS.items():
     for style in ('BODY', 'HAND', 'GRIP', 'STYLIZED'):
         sj._apply_contact_style(mod, key, style)
         assert sj._layer_meta(mod, 'sj_contact_style') == style
+        # the table models exactly what the sockets end up holding
+        idents = sj._input_ident_map(ng)
+        live = {n: sj._get_input(mod, idents[n]) for n in expected[key, style, False]}
+        assert same_values(live, expected[key, style, False]), (key, style)
         actual_gap = sj._get_input(mod, sj._input_ident_map(ng)['Collision Distance'])
         assert 0 <= actual_gap <= .01
 print(f'SJ_CHECK: all {len(sj.PRESETS) * 4} body/contact profile combinations load', flush=True)

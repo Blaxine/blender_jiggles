@@ -39,6 +39,10 @@ The regression script checks:
   settings are synced back to the layer.
 - Reset All restores Soft Skin values together with the preset and contact
   style labels.
+- All 232 preset x contact style x bone combinations leave distinct socket
+  values (closest pair: 17.2 % apart in Collision Friction), and the values
+  applying them writes match the table exactly, so a layer's labels could be
+  recognised from its socket values alone.
 - All 29 presets (25 body, 4 material) match their declared frequency and
   damping ratio, stay
   within every exposed parameter range, and avoid the stiffness stability

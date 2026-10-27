@@ -91,6 +91,7 @@ check("body with Collision is not a collider (no cycle)",
 
 # 2 every preset converts to an isotropic bone spring
 bad = []
+table = sjp._expected_layers()
 mod = sjp._jiggle_modifiers(h_br)[0]
 ng = mod.node_group
 im = sjp._input_ident_map(ng)
@@ -99,7 +100,9 @@ for key, (_, vals) in sjp.PRESETS.items():
                                          object_name=h_br.name, preset=key)
     want = vals['Stiffness'] * max(1 - vals['Normal Softness'], .02)
     if (r != {'FINISHED'} or abs(sjp._get_input(mod, im['Stiffness']) - want) > 1e-3
-            or sjp._get_input(mod, im['Normal Softness']) != 0.0 or sjp._layer_meta(mod, 'sj_body_preset') != key):
+            or sjp._get_input(mod, im['Normal Softness']) != 0.0 or sjp._layer_meta(mod, 'sj_body_preset') != key
+            or any(not math.isclose(sjp._get_input(mod, im[n]), v, rel_tol=1e-5, abs_tol=1e-9)
+                   for n, v in table[key, 'BODY', True].items())):
         bad.append(key)
 check("all presets apply to a bone as isotropic springs", not bad,
       f"{len(sjp.PRESETS) - len(bad)}/{len(sjp.PRESETS)}")

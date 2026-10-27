@@ -49,6 +49,7 @@ import bpy
 import math
 import logging
 import os
+import struct
 import uuid
 from bpy.types import Operator, Panel
 from bpy.props import BoolProperty, EnumProperty, StringProperty
@@ -1572,23 +1573,27 @@ def _is_bone_layer(mod):
     return bool(_layer_meta(mod, 'sj_bone')
                 or mod.id_data.get("sj_bone_helper"))
 
-def _apply_preset(mod, ng, preset_key):
+def _preset_layer_values(preset_key, bone=False):
     values = dict(PRESETS[preset_key][1])
-    if _is_bone_layer(mod):
+    if bone:
         # A bone tip has no surface: make the spring isotropic at the
         # preset's normal-mode stiffness, so the bone swings at exactly the
         # preset's frequency in every direction. Folds need a surface.
         values['Stiffness'] *= max(1.0 - values['Normal Softness'], 0.02)
         values['Normal Softness'] = 0.0
         values['Fold Smoothing'] = 0.0
+    return values
+
+def _apply_preset(mod, ng, preset_key):
+    values = _preset_layer_values(preset_key, _is_bone_layer(mod))
     for name, value in values.items():
         _set_value(mod, ng, name, value)
     _set_layer_meta(mod, 'sj_body_preset', preset_key)
     _set_layer_meta(mod, 'sj_contact_style', 'BODY')
 
 
-def _apply_contact_style(mod, preset_key, style):
-    """Apply per-layer collision response while preserving body physics."""
+def _contact_values(preset_key, style):
+    """Collision response of a contact style on top of a body preset."""
     base = _CONTACT_PRESET_BASE.get(preset_key, _CONTACT_PRESET_BASE['SOFT_SKIN'])
     gap, friction, squash, bounce, spread = base
     if style == 'HAND':
@@ -1597,12 +1602,38 @@ def _apply_contact_style(mod, preset_key, style):
         gap, friction, squash, bounce, spread = gap * .65, min(friction * 1.65, 1.0), squash * 1.6, 0.0, min(spread + 1, 16)
     elif style == 'STYLIZED':
         gap, friction, squash, bounce, spread = max(gap, .003), min(friction * .8, 1.0), max(squash * 2.2, .8), .35, min(spread + 2, 16)
-    for name, value in (('Collision Distance', gap),
-                        ('Collision Friction', friction),
-                        ('Squash Amount', squash), ('Bounce', bounce),
-                        ('Squash Spread', spread)):
+    return {'Collision Distance': gap, 'Collision Friction': friction,
+            'Squash Amount': squash, 'Bounce': bounce,
+            'Squash Spread': spread}
+
+def _apply_contact_style(mod, preset_key, style):
+    """Apply per-layer collision response while preserving body physics."""
+    for name, value in _contact_values(preset_key, style).items():
         _set_value(mod, mod.node_group, name, value)
     _set_layer_meta(mod, 'sj_contact_style', style)
+
+def _expected_layers():
+    """Socket values each preset x contact style x bone variant leaves on a
+    layer, as the sockets store them (ints truncated like _set_value, floats
+    rounded to float32). Socket values survive file loads where the layer's
+    own keys did not, so its labels can be recognised from them."""
+    kinds = {name: kind for name, kind, *_ in _SOCKET_DEFS}
+
+    def stored(name, value):
+        if kinds.get(name) == 'NodeSocketInt':
+            return int(value)
+        return struct.unpack('f', struct.pack('f', value))[0]
+
+    table = {}
+    for key in PRESETS:
+        for bone in (False, True):
+            for style, _label, _tip in _CONTACT_STYLES:
+                values = _preset_layer_values(key, bone)
+                values.update(_contact_values(key, style))
+                table[key, style, bone] = {name: stored(name, v)
+                                           for name, v in values.items()}
+    return table
+
 
 def _jiggle_modifiers(obj):
     return [m for m in obj.modifiers
