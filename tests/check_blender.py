@@ -3,6 +3,7 @@ import importlib.util
 import math
 from pathlib import Path
 import sys
+import tempfile
 
 import bpy
 
@@ -86,7 +87,7 @@ assert abs(coords[0].z) < 1e-6, ('unpainted vertex moved', coords[0])
 assert coords[1].z > .01, ('simulation did not advance', coords)
 # The floor needs 50 mm of travel, Max Stretch allows 25 mm of jiggle:
 # Contact Reach (default 100 mm) lets the collision win instead of clipping.
-reach = mod[sj._input_ident_map(ng)['Contact Reach']]
+reach = sj._get_input(mod, sj._input_ident_map(ng)['Contact Reach'])
 assert all(v.z >= .05 - 1e-4 for v in coords[1:]), ('skin clipped through floor', coords)
 assert all((v - ob.matrix_world @ ob.data.vertices[i].co).length <= .025 + reach + 1e-5
            for i, v in enumerate(coords)), ('contact reach exceeded', coords)
@@ -145,11 +146,11 @@ print('SJ_CHECK: copied bake paths separated and stable', flush=True)
 
 for key, (_, preset_values) in sj.PRESETS.items():
     sj._apply_preset(mod, ng, key)
-    assert mod['sj_body_preset'] == key
+    assert sj._layer_meta(mod, 'sj_body_preset') == key
     for style in ('BODY', 'HAND', 'GRIP', 'STYLIZED'):
         sj._apply_contact_style(mod, key, style)
-        assert mod['sj_contact_style'] == style
-        actual_gap = mod[sj._input_ident_map(ng)['Collision Distance']]
+        assert sj._layer_meta(mod, 'sj_contact_style') == style
+        actual_gap = sj._get_input(mod, sj._input_ident_map(ng)['Collision Distance'])
         assert 0 <= actual_gap <= .01
 print(f'SJ_CHECK: all {len(sj.PRESETS) * 4} body/contact profile combinations load', flush=True)
 
@@ -159,12 +160,12 @@ sj._apply_preset(mod, ng, 'CHEST_D')
 sj._apply_contact_style(mod, 'CHEST_D', 'STYLIZED')
 bpy.context.view_layer.objects.active = ob
 assert bpy.ops.skin_jiggle.reset_defaults() == {'FINISHED'}
-assert mod['sj_body_preset'] == 'SOFT_SKIN', mod['sj_body_preset']
-assert mod['sj_contact_style'] == 'BODY', mod['sj_contact_style']
+assert sj._layer_meta(mod, 'sj_body_preset') == 'SOFT_SKIN', sj._layer_meta(mod, 'sj_body_preset')
+assert sj._layer_meta(mod, 'sj_contact_style') == 'BODY', sj._layer_meta(mod, 'sj_contact_style')
 assert sj._preset_label(mod) == 'Soft Skin'
 idents = sj._input_ident_map(ng)
 for name, value in sj.PRESETS['SOFT_SKIN'][1].items():
-    assert math.isclose(mod[idents[name]], value, rel_tol=1e-5), (name, mod[idents[name]], value)
+    assert math.isclose(sj._get_input(mod, idents[name]), value, rel_tol=1e-5), (name, sj._get_input(mod, idents[name]), value)
 print('SJ_CHECK: Reset All restores Soft Skin values and labels', flush=True)
 
 scene.cursor.location = (5, 5, 5)
@@ -228,6 +229,23 @@ mod.name = 'Renamed layer'
 assert sj._cage_source(cage) == (ob, mod.name)
 sj._delete_layer_cage(mod)
 print('SJ_CHECK: cage duplicate ownership and rename pass', flush=True)
+
+# Blender 5.2 has no modifier IDProperties: layer data lives on the object
+# under the modifier's uid, which survives renames.
+meta_ob = mesh_object('Meta', quad, [(0, 1, 2, 3)])
+mm, _, _ = sj._create_layer(bpy.context, meta_ob, 'Tissue', 'CHEST_D')
+assert sj._meta_slot(mm) in meta_ob[sj._META]
+mm.name = 'Renamed meta layer'
+assert sj._preset_label(mm) == sj.PRESETS['CHEST_D'][0]
+# A new layer of a removed one's name (same uid) starts clean.
+sj._set_layer_meta(mm, 'sj_bone', True)
+bpy.context.view_layer.objects.active = meta_ob
+assert bpy.ops.skin_jiggle.remove_layer(modifier_name=mm.name) == {'FINISHED'}
+assert not meta_ob[sj._META].keys()
+mm, _, _ = sj._create_layer(bpy.context, meta_ob, 'Tissue', 'SOFT_SKIN')
+assert not sj._is_bone_layer(mm) and sj._layer_group(mm) == 'Tissue'
+bpy.data.objects.remove(meta_ob, do_unlink=True)
+print('SJ_CHECK: layer data follows renames and removal', flush=True)
 
 # Legacy operator retry must propagate errors to the outer UI handler.
 calls = []
@@ -300,5 +318,25 @@ for fps in (24, 60):
     assert abs(measured / expected - 1) < .15, (fps, measured, expected)
     print('SJ_CHECK: forced response', fps, 'fps:', round(measured, 6),
           'm; analytic:', round(expected, 6), 'm', flush=True)
+
+
+# Last: layer data must survive a save and reload. Blender rebuilds a
+# Geometry Nodes modifier's keys from its node group on load, which
+# dropped it while it lived on the modifier.
+reload_ob = mesh_object('Reload', quad, [(0, 1, 2, 3)])
+rm, _, _ = sj._create_layer(bpy.context, reload_ob, 'Tissue', 'CHEST_D')
+sj._apply_contact_style(rm, 'CHEST_D', 'GRIP')
+stiffness = sj._input_ident_map(ng)['Stiffness']
+sj._put_input(rm, stiffness, 123.0)
+path = Path(tempfile.mkdtemp(prefix='sj_check_')) / 'reload.blend'
+name = rm.name
+bpy.ops.wm.save_as_mainfile(filepath=str(path))
+bpy.ops.wm.open_mainfile(filepath=str(path))
+rm = bpy.data.objects['Reload'].modifiers[name]
+assert sj._layer_meta(rm, 'sj_body_preset') == 'CHEST_D'
+assert sj._layer_meta(rm, 'sj_contact_style') == 'GRIP'
+assert sj._layer_group(rm) == 'Tissue'
+assert math.isclose(sj._get_input(rm, stiffness), 123.0)
+print('SJ_CHECK: layer data survives save and reload', flush=True)
 
 sj.unregister()
